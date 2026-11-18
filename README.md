@@ -80,7 +80,7 @@ sessions first (◉ same branch, ○ same repo). Inside a repo, plain
   last time?"* (see [Use from Claude Code](#use-from-claude-code-mcp)).
 - **Fast.** It's written in Rust: transcripts are parsed in parallel, and only
   changed files are re-parsed. On a synthetic 641 MB history of 2,000
-  sessions, the first index takes about 4 s; after that the automatic
+  sessions, the first index takes about 7 s; after that the automatic
   re-index on every launch takes about 10 ms, so the picker opens at once.
 
 ## Install
