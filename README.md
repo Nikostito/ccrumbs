@@ -33,6 +33,12 @@ sessions first (◉ same branch, ○ same repo). Inside a repo, plain
   *"Created and reviewed in the SAME session"*, or *"Reviewed by B · created
   outside your Claude sessions"*. A session's detail view also says
   *"↳ created in another session: …"* next to PRs it only reviewed.
+- **Context fill and cost per session.** Each session shows how full its
+  context window was when it ended (◔ green under 50%, yellow under 80%, red
+  above), how many times it was compacted, and what it cost, taken from
+  Claude Code's own cost tally. A session at 87% is close to compacting
+  again, so it's often better to start fresh than to resume it.
+  `ctx:>80` finds those sessions.
 - **Starts where you are.** Run it inside a repo and sessions from your
   current branch come first, then the rest of that repo, then everything
   else. `Ctrl-G` switches to plain newest-first.
@@ -103,6 +109,7 @@ Plain words match titles, projects, branches, descriptions and prompts:
 | `#42`, `acme/web#42`, PR URL | only sessions linked to that PR, creator first |
 | `p:` `b:` `f:` `repo:` `has:pr` | project, branch, edited file, repo, did PR work |
 | `@today` `@yesterday` `@week` `@month` `@3d` `@2w` | last active in that window |
+| `ctx:>80`, `ctx:<30` | how full the context window was at the end |
 | **Enter** | resume the session (in Tasks / PRs: list that task's or PR's sessions) |
 | **Tab** / **Shift-Tab** | cycle Sessions → Tasks → PRs |
 | `Ctrl-G` | toggle "here first" ranking (repo and branch you started in) |
@@ -184,12 +191,17 @@ and other PR URLs in the same session.
 {
   "claude_projects_dir": null,
   "ignored_projects": [],
-  "describe_model": "claude-opus-5-5"
+  "describe_model": "claude-opus-5-5",
+  "context_windows": {}
 }
 ```
 
 - `claude_projects_dir` defaults to `$CLAUDE_CONFIG_DIR/projects` or
   `~/.claude/projects`.
+- `context_windows` overrides the context size used for the ◔ percentage,
+  matched as a substring of the model id, e.g. `{"sonnet-4-5": 1000000}`.
+  Built in: 1M for the Claude 5 family, Opus 4.6–4.8, Sonnet 4.6 and `[1m]`
+  models; 200k for the rest.
 - `cctrail ignore <substring>` / `cctrail unignore <substring>` stops (or
   resumes) indexing matching projects.
 - `CCTRAIL_HOME` moves the index and config elsewhere.

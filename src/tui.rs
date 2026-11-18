@@ -66,6 +66,14 @@ pub fn role_color(r: Role) -> Color {
     }
 }
 
+pub fn ctx_color(pct: u32) -> Color {
+    match pct {
+        0..50 => Color::Green,
+        50..80 => Color::Yellow,
+        _ => Color::Red,
+    }
+}
+
 const DIM: Style = Style::new().fg(Color::DarkGray);
 const BOLD: Style = Style::new().add_modifier(Modifier::BOLD);
 
@@ -619,6 +627,12 @@ fn draw_session_list(f: &mut Frame, app: &mut App, area: Rect) {
             if let Some(b) = &s.branch {
                 l2.push(Span::styled(format!(" ⎇ {}", truncate(b, 28)), DIM));
             }
+            if let Some(pct) = s.context_pct() {
+                l2.push(Span::styled(
+                    format!(" ◔{pct}%"),
+                    Style::new().fg(ctx_color(pct)),
+                ));
+            }
             if s.cloud_id.is_some() || s.entrypoint.as_deref() == Some("remote") {
                 l2.push(Span::styled(" ☁", DIM));
             }
@@ -698,13 +712,24 @@ fn draw_session_preview(f: &mut Frame, app: &App, area: Rect) {
     if let Some(d) = duration(s.started.as_deref(), s.ended.as_deref()) {
         meta.push_str(&format!(" · {d}"));
     }
-    if s.tokens_out > 0 {
-        meta.push_str(&format!(" · {} out", crate::text::tokens(s.tokens_out)));
+    if s.cost_usd > 0.0 {
+        meta.push_str(&format!(" · ${:.2}", s.cost_usd));
     }
     if let Some(m) = &s.model {
         meta.push_str(&format!(" · {m}"));
     }
     lines.push(Line::from(Span::styled(meta, DIM)));
+    if let (Some(c), Some(pct)) = (s.context_summary(), s.context_pct()) {
+        let hint = if pct >= 80 {
+            "  — nearly full: consider a fresh session"
+        } else {
+            ""
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("◔ {c}"), Style::new().fg(ctx_color(pct))),
+            Span::styled(hint, DIM),
+        ]));
+    }
     lines.push(Line::from(Span::styled(format!("id {}", s.id), DIM)));
     if let Some(c) = &s.cloud_id {
         lines.push(Line::from(Span::styled(

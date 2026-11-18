@@ -15,6 +15,20 @@ pub struct Config {
     pub ignored_projects: Vec<String>,
     /// Model used by `cctrail describe`.
     pub describe_model: String,
+    /// Override context windows: model-id substring -> tokens, e.g. {"sonnet-4-5": 1000000}.
+    pub context_windows: std::collections::BTreeMap<String, u64>,
+}
+
+static OVERRIDES: std::sync::OnceLock<std::collections::BTreeMap<String, u64>> =
+    std::sync::OnceLock::new();
+
+/// Context window override for a model, if the config has one.
+pub fn context_override(model: &str) -> Option<u64> {
+    OVERRIDES
+        .get()?
+        .iter()
+        .find(|(k, _)| model.contains(k.as_str()))
+        .map(|(_, v)| *v)
 }
 
 impl Default for Config {
@@ -23,6 +37,7 @@ impl Default for Config {
             claude_projects_dir: None,
             ignored_projects: vec![],
             describe_model: DEFAULT_MODEL.into(),
+            context_windows: Default::default(),
         }
     }
 }
@@ -47,10 +62,12 @@ pub fn db_path() -> PathBuf {
 
 impl Config {
     pub fn load() -> Config {
-        std::fs::read_to_string(config_path())
+        let cfg: Config = std::fs::read_to_string(config_path())
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let _ = OVERRIDES.set(cfg.context_windows.clone());
+        cfg
     }
 
     pub fn save(&self) -> Result<()> {

@@ -26,6 +26,9 @@ pub struct Query {
     pub until: Option<DateTime<Utc>>,
     pub has_pr: bool,
     pub task: Option<usize>,
+    /// `ctx:>80` / `ctx:<30` (`ctx:80` means at least 80%).
+    pub ctx_min: Option<u32>,
+    pub ctx_max: Option<u32>,
 }
 
 fn start_of_day(days_ago: i64) -> DateTime<Utc> {
@@ -81,6 +84,19 @@ pub fn parse(q: &str) -> Query {
             out.repo.push(v);
         } else if let Some(v) = val(&["task:"]).and_then(|v| v.parse().ok()) {
             out.task = Some(v);
+        } else if let Some(v) = val(&["ctx:", "context:"]) {
+            let num = |t: &str| t.trim_end_matches('%').parse::<u32>().ok();
+            if let Some(n) = v.strip_prefix('<').and_then(num) {
+                out.ctx_max = Some(n);
+            } else if let Some(n) = v
+                .strip_prefix('>')
+                .map(|t| t.trim_start_matches('='))
+                .and_then(num)
+            {
+                out.ctx_min = Some(n);
+            } else if let Some(n) = num(&v) {
+                out.ctx_min = Some(n);
+            }
         } else if lw == "has:pr" || lw == "has:prs" {
             out.has_pr = true;
         } else if let Some((since, until)) = lw.strip_prefix('@').and_then(parse_age) {
@@ -218,6 +234,14 @@ pub fn passes(s: &SessionRow, task: Option<usize>, q: &Query) -> bool {
     }
     if q.task.is_some() && q.task != task {
         return false;
+    }
+    if q.ctx_min.is_some() || q.ctx_max.is_some() {
+        let Some(pct) = s.context_pct() else {
+            return false;
+        };
+        if q.ctx_min.is_some_and(|m| pct < m) || q.ctx_max.is_some_and(|m| pct > m) {
+            return false;
+        }
     }
     let last = s
         .ended
@@ -360,6 +384,8 @@ mod tests {
         assert!(q.has_pr && q.since.is_some());
         assert_eq!(q.prs, vec![(None, 88)]);
         assert_eq!(q.text, "bucket");
+        let q = parse("ctx:>80 ctx:<95");
+        assert_eq!((q.ctx_min, q.ctx_max), (Some(80), Some(95)));
     }
 
     #[test]

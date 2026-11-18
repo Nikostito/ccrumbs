@@ -508,10 +508,22 @@ fn badges(p: &Paint, s: &SessionRow) -> String {
 }
 
 fn print_row(p: &Paint, s: &SessionRow, long: bool) {
+    let ctx = match s.context_pct() {
+        Some(pct) => {
+            let code = match pct {
+                0..50 => "32",
+                50..80 => "33",
+                _ => "31",
+            };
+            p.c(code, format!("{pct:>3}%"))
+        }
+        None => "    ".to_string(),
+    };
     println!(
-        "{}  {:>4}  {:<18}  {}{}",
+        "{}  {:>4}  {}  {:<18}  {}{}",
         p.c("34", s.short_id()),
         age(s.ended.as_deref().or(s.started.as_deref())),
+        ctx,
         truncate(&s.project_name(), 18),
         p.bold(truncate(&s.title(), 70)),
         badges(p, s)
@@ -563,6 +575,9 @@ fn show(p: &Paint, s: &SessionRow, sessions: &[SessionRow], prs: &[PrEntry]) {
             text::tokens(s.tokens_out)
         ));
     }
+    if s.cost_usd > 0.0 {
+        meta.push_str(&format!(" · ${:.2}", s.cost_usd));
+    }
     if s.tests_ran {
         meta.push_str(" · ran tests");
     }
@@ -577,6 +592,9 @@ fn show(p: &Paint, s: &SessionRow, sessions: &[SessionRow], prs: &[PrEntry]) {
         meta.push_str(&format!(" · {m}"));
     }
     println!("{}", p.dim(meta));
+    if let Some(c) = s.context_summary() {
+        println!("{}", p.dim(c));
+    }
     if let Some(c) = &s.cloud_id {
         println!(
             "{}",

@@ -32,6 +32,8 @@ struct State {
     files: Vec<String>,
     files_seen: HashSet<String>,
     cur_ts: Option<String>,
+    /// Final `totalCostUSD` per Claude Code process run (keyed by its start time).
+    cost_runs: HashMap<i64, f64>,
 }
 
 /// Parse a session transcript plus any subagent transcripts stored beside it.
@@ -57,6 +59,7 @@ pub fn parse_session(
             }
         }
     }
+    st.s.cost_usd = st.cost_runs.values().sum();
     st.s.cloud_id = st
         .cloud
         .iter()
@@ -131,7 +134,23 @@ fn handle(v: &Value, st: &mut State, sidechain_file: bool) {
         }
     }
 
+    if !sidechain_file
+        && (v
+            .get("isCompactSummary")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false)
+            || (ty == "system" && str_of(v, "subtype") == Some("compact_boundary")))
+    {
+        st.s.compactions += 1;
+    }
+
     match ty {
+        "cost-state" if !sidechain_file => {
+            if let Some(c) = v.get("totalCostUSD").and_then(|x| x.as_f64()) {
+                let run = v.get("startTime").and_then(|x| x.as_i64()).unwrap_or(0);
+                st.cost_runs.insert(run, c);
+            }
+        }
         "summary" => {
             if let Some(s) = str_of(v, "summary").filter(|s| !s.trim().is_empty()) {
                 st.s.summary = Some(text::one_line(s));
@@ -267,6 +286,17 @@ fn handle_assistant(v: &Value, st: &mut State) {
             g("input_tokens") + g("cache_creation_input_tokens") + g("cache_read_input_tokens");
         st.s.tokens_out += g("output_tokens");
     }
+    // Context at the latest main-thread reply: everything sent in, plus what it wrote.
+    if !side && let Some(u) = msg.get("usage") {
+        let g = |k: &str| u.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+        let ctx = g("input_tokens")
+            + g("cache_creation_input_tokens")
+            + g("cache_read_input_tokens")
+            + g("output_tokens");
+        if ctx > 0 {
+            st.s.context_tokens = ctx;
+        }
+    }
     let Some(Value::Array(blocks)) = msg.get("content") else {
         return;
     };
@@ -366,4 +396,32 @@ fn push_text(buf: &mut String, t: &str) {
     let room = FULLTEXT_CAP - buf.len();
     buf.push_str(text::cap_bytes(t, room));
     buf.push('\n');
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_cost_and_compactions() {
+        let dir = std::env::temp_dir().join(format!("cctrail-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("s1.jsonl");
+        let lines = [
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{"id":"m1","model":"claude-opus-5-5","content":[{"type":"text","text":"a"}],"usage":{"input_tokens":10,"cache_read_input_tokens":500000,"cache_creation_input_tokens":0,"output_tokens":90}}}"#,
+            r#"{"type":"cost-state","totalCostUSD":1.5,"startTime":1}"#,
+            r#"{"type":"cost-state","totalCostUSD":2.5,"startTime":1}"#,
+            r#"{"type":"system","subtype":"compact_boundary","timestamp":"2026-01-01T00:00:02Z"}"#,
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:03Z","message":{"id":"m2","model":"claude-opus-5-5","content":[{"type":"text","text":"b"}],"usage":{"input_tokens":5,"cache_read_input_tokens":40000,"output_tokens":5}}}"#,
+            r#"{"type":"assistant","isSidechain":true,"message":{"id":"m3","content":[],"usage":{"input_tokens":900000}}}"#,
+            r#"{"type":"cost-state","totalCostUSD":0.75,"startTime":2}"#,
+        ];
+        std::fs::write(&f, lines.join("\n")).unwrap();
+        let s = parse_session(&f, "p", &[]).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(s.context_tokens, 40010); // latest main-thread reply, not the subagent
+        assert_eq!(s.compactions, 1);
+        assert!((s.cost_usd - 3.25).abs() < 1e-9); // last value per run, summed
+    }
 }

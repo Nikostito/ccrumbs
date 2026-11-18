@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 /// Bump when the derived tables change shape; they are rebuilt from transcripts.
 /// `ai` and `prs` hold data that can't be re-derived locally and are kept.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 pub struct Db {
     pub conn: Connection,
@@ -43,7 +43,8 @@ impl Db {
                 custom_title TEXT, summary TEXT, first_prompt TEXT, last_prompt TEXT, prompts_json TEXT,
                 files_json TEXT, commands_run INT, tests_ran INT, commits INT,
                 tokens_in INT, tokens_out INT, model TEXT, entrypoint TEXT, cloud_id TEXT,
-                last_reply TEXT, auto_desc TEXT, mtime INT, size INT, missing INT DEFAULT 0
+                last_reply TEXT, auto_desc TEXT, mtime INT, size INT, missing INT DEFAULT 0,
+                context_tokens INT DEFAULT 0, compactions INT DEFAULT 0, cost_usd REAL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS sessions_started ON sessions(started);
             CREATE INDEX IF NOT EXISTS sessions_cloud ON sessions(cloud_id);
@@ -88,8 +89,8 @@ impl Db {
                 "INSERT INTO sessions (id, path, project_dir, cwd, branch, repo, started, ended, user_prompts,
                  assistant_msgs, custom_title, summary, first_prompt, last_prompt, prompts_json, files_json,
                  commands_run, tests_ran, commits, tokens_in, tokens_out, model, entrypoint, cloud_id,
-                 last_reply, auto_desc, mtime, size, missing)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,0)",
+                 last_reply, auto_desc, mtime, size, missing, context_tokens, compactions, cost_usd)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,0,?29,?30,?31)",
             )?;
             let mut ins_p = tx.prepare(
                 "INSERT OR IGNORE INTO session_prs (session_id, repo, number, role, ts, evidence) VALUES (?1,?2,?3,?4,?5,?6)",
@@ -134,7 +135,10 @@ impl Db {
                     s.last_reply,
                     auto,
                     s.mtime,
-                    s.size
+                    s.size,
+                    s.context_tokens as i64,
+                    s.compactions,
+                    s.cost_usd
                 ])?;
                 for l in &s.pr_links {
                     ins_p.execute(params![
@@ -212,7 +216,8 @@ impl Db {
         let mut st = self.conn.prepare(
             "SELECT s.id, s.path, s.project_dir, s.cwd, s.branch, s.repo, s.started, s.ended, s.user_prompts,
                     s.custom_title, s.summary, s.first_prompt, s.last_prompt, s.files_json, s.tests_ran, s.commits,
-                    s.tokens_in, s.tokens_out, s.model, s.entrypoint, s.cloud_id, s.auto_desc, a.title, a.description, s.missing
+                    s.tokens_in, s.tokens_out, s.model, s.entrypoint, s.cloud_id, s.auto_desc, a.title, a.description, s.missing,
+                    s.context_tokens, s.compactions, s.cost_usd
              FROM sessions s LEFT JOIN ai a ON a.id = s.id
              ORDER BY COALESCE(s.ended, s.started) DESC",
         )?;
@@ -247,6 +252,9 @@ impl Db {
                 ai_desc: r.get(23)?,
                 prs: vec![],
                 missing: r.get::<_, Option<bool>>(24)?.unwrap_or(false),
+                context_tokens: r.get::<_, Option<i64>>(25)?.unwrap_or(0) as u64,
+                compactions: r.get::<_, Option<u32>>(26)?.unwrap_or(0),
+                cost_usd: r.get::<_, Option<f64>>(27)?.unwrap_or(0.0),
             })
         })?;
         let mut out: Vec<SessionRow> = rows.collect::<Result<_, _>>()?;

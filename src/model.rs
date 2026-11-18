@@ -112,6 +112,12 @@ pub struct ParsedSession {
     pub commits: u32,
     pub tokens_in: u64,
     pub tokens_out: u64,
+    /// Context size (tokens) at the last main-thread reply.
+    pub context_tokens: u64,
+    /// Times the conversation was compacted.
+    pub compactions: u32,
+    /// Claude Code's own cost tally for the session, summed over runs (resumes).
+    pub cost_usd: f64,
     pub model: Option<String>,
     pub entrypoint: Option<String>,
     /// `session_...` id of the claude.ai cloud session, if the transcript reveals one.
@@ -146,6 +152,9 @@ pub struct SessionRow {
     pub commits: u32,
     pub tokens_in: u64,
     pub tokens_out: u64,
+    pub context_tokens: u64,
+    pub compactions: u32,
+    pub cost_usd: f64,
     pub model: Option<String>,
     pub entrypoint: Option<String>,
     pub cloud_id: Option<String>,
@@ -216,6 +225,34 @@ impl SessionRow {
         out
     }
 
+    /// How full the context window was when the session ended, in percent.
+    pub fn context_pct(&self) -> Option<u32> {
+        if self.context_tokens == 0 {
+            return None;
+        }
+        let window = context_window(self.model.as_deref().unwrap_or(""));
+        Some(
+            ((self.context_tokens as f64 / window as f64) * 100.0)
+                .round()
+                .min(999.0) as u32,
+        )
+    }
+
+    /// "389k / 1M (39%) · compacted 2×", or None without usage data.
+    pub fn context_summary(&self) -> Option<String> {
+        let pct = self.context_pct()?;
+        let window = context_window(self.model.as_deref().unwrap_or(""));
+        let mut out = format!(
+            "context {} / {} ({pct}%)",
+            crate::text::tokens(self.context_tokens),
+            crate::text::tokens(window)
+        );
+        if self.compactions > 0 {
+            out.push_str(&format!(" · compacted {}×", self.compactions));
+        }
+        Some(out)
+    }
+
     pub fn short_id(&self) -> &str {
         &self.id[..self.id.len().min(8)]
     }
@@ -236,4 +273,28 @@ pub struct PrMeta {
     pub body_session: Option<String>,
     /// PR body carries the "Generated with Claude Code" footer.
     pub claude_footer: bool,
+}
+
+/// Context window of a model, in tokens. `context_windows` in the config overrides this
+/// (keys are matched as substrings of the model id).
+pub fn context_window(model: &str) -> u64 {
+    if let Some(n) = crate::config::context_override(model) {
+        return n;
+    }
+    let m = model.to_lowercase();
+    let million = m.ends_with("[1m]")
+        || [
+            "opus-5",
+            "sonnet-5",
+            "haiku-5",
+            "fable",
+            "mythos",
+            "opus-4-6",
+            "opus-4-7",
+            "opus-4-8",
+            "sonnet-4-6",
+        ]
+        .iter()
+        .any(|k| m.contains(k));
+    if million { 1_000_000 } else { 200_000 }
 }
