@@ -7,7 +7,9 @@ Find a Claude Code session in seconds, see what it did and which PRs it
 
 Type a few words (or `#123` for a PR), press **Enter**, and you're back in
 that session: cctrail `cd`s into its directory and runs
-`claude --resume <id>` for you.
+`claude --resume <id>` for you. Started inside a repo, it puts that repo's
+sessions first (◉ same branch, ○ same repo). Inside a repo, plain
+`cctrail go` continues the latest session on your branch.
 
 ## What it gives you
 
@@ -31,6 +33,23 @@ that session: cctrail `cd`s into its directory and runs
   *"Created and reviewed in the SAME session"*, or *"Reviewed by B · created
   outside your Claude sessions"*. A session's detail view also says
   *"↳ created in another session: …"* next to PRs it only reviewed.
+- **Starts where you are.** Run it inside a repo and sessions from your
+  current branch come first, then the rest of that repo, then everything
+  else. `Ctrl-G` switches to plain newest-first.
+- **Tasks: sessions that belong together.** Sessions that worked on the same
+  branch, or on the same PR (created it, reviewed it, addressed the review),
+  are grouped into one task. The Tasks view shows the whole story in order,
+  and each session's preview lists its earlier and later sessions:
+
+  ![Tasks view: three sessions behind one PR](docs/tasks.png)
+
+- **Filters you can type.** `p:api`, `b:feat`, `f:ratelimit.rs` (a file it
+  edited), `repo:acme/web`, `has:pr`, `@today`, `@yesterday`, `@week`,
+  `@3d`, and `#88`, all combinable with plain words. `Ctrl-T` hides one-off
+  quick questions.
+
+  ![Filtering by an edited file](docs/filters.png)
+
 - **Fast.** It's written in Rust: transcripts are parsed in parallel, and only
   changed files are re-parsed. On a synthetic 641 MB history of 2,000
   sessions, the first index takes about 4 s; after that the automatic
@@ -52,10 +71,12 @@ Or, from a clone, run `cargo install --path . --locked`. That puts a single
 | Command | What it does |
 |---|---|
 | `cctrail` | Open the picker |
-| `cctrail go <words / id / #PR>` | Jump straight in when there's exactly one match; otherwise open the picker with that query |
+| `cctrail go` | Inside a repo: continue the latest session on this branch (else this repo) |
+| `cctrail go <words / id / #PR / filters>` | Jump straight in when there's exactly one match; otherwise open the picker with that query |
+| `cctrail tasks` | Sessions grouped by task, with each one's role on the task's PRs |
 | `cctrail pr 42` | Who created / reviewed / merged PR 42, then `cctrail go <id>` |
 | `cctrail prs [--claude] [--repo web]` | PRs your sessions created or reviewed; `--claude` keeps only the ones born from a Claude session |
-| `cctrail list [-n 50] [-p project] [-s]` | Recent sessions with descriptions |
+| `cctrail list [query] [-n 50] [-s]` | Recent sessions with descriptions, e.g. `cctrail list f:auth @week` |
 | `cctrail search <words>` | Full-text search across every prompt, reply and shell command |
 | `cctrail show <id>` | Everything about one session |
 | `cctrail resume <id> [--tab \| --print]` | Resume here, in a new terminal tab, or just print the command |
@@ -63,7 +84,7 @@ Or, from a clone, run `cargo install --path . --locked`. That puts a single
 Session ids can be abbreviated to their first few characters, like git
 hashes.
 
-![cctrail pr 88 and cctrail prs --claude](docs/cli-pr.png)
+![cctrail pr 88 and cctrail tasks](docs/cli-pr.png)
 
 ### Picker keys
 
@@ -80,8 +101,12 @@ Plain words match titles, projects, branches, descriptions and prompts:
 |---|---|
 | typing | filter (fuzzy on title, project, branch, PR numbers; falls back to description and prompts) |
 | `#42`, `acme/web#42`, PR URL | only sessions linked to that PR, creator first |
-| **Enter** | resume the session (on the PRs tab: show that PR's sessions) |
-| **Tab** | switch between Sessions and PRs |
+| `p:` `b:` `f:` `repo:` `has:pr` | project, branch, edited file, repo, did PR work |
+| `@today` `@yesterday` `@week` `@month` `@3d` `@2w` | last active in that window |
+| **Enter** | resume the session (in Tasks / PRs: list that task's or PR's sessions) |
+| **Tab** / **Shift-Tab** | cycle Sessions → Tasks → PRs |
+| `Ctrl-G` | toggle "here first" ranking (repo and branch you started in) |
+| `Ctrl-T` | hide / show one-off quick sessions (1 prompt, no edits, no PRs) |
 | `Ctrl-O` | resume in a new terminal tab (tmux, zellij, wezterm, kitty, iTerm2, Terminal.app, GNOME Terminal, Konsole, Windows Terminal, …) |
 | `Ctrl-Y` | copy `cd … && claude --resume …` |
 | `Ctrl-F` | toggle full-text search |
@@ -123,6 +148,18 @@ This fetches PR titles and state, and marks PRs whose body links a cloud
 session, or carries the "Generated with Claude Code" footer, as **born from
 Claude**, even when there's no transcript on this machine. It also links
 sessions that worked on a PR's head branch.
+
+## How tasks are formed
+
+Two sessions land in the same task when they:
+
+- worked on the same non-default branch (anything but `main`, `master`,
+  `develop`, `dev` or `trunk`) of the same repo, or
+- both did something concrete with the same PR: created, reviewed, merged,
+  commented on, or worked on it.
+
+The task's title is the PR title when one is known (after `cctrail sync`),
+otherwise the branch name. Only groups of two or more sessions are listed.
 
 ## How detection works
 

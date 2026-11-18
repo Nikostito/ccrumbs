@@ -1,11 +1,13 @@
 //! The picker: type to find a session, Enter to jump back into it.
 
 use crate::config::Config;
+use crate::context::Context;
 use crate::db::Db;
 use crate::launch;
 use crate::model::{Role, SessionRow};
 use crate::prview::{self, Actor, PrEntry};
-use crate::search::{self, Ranker};
+use crate::search::{self, Corpus, Opts, Ranker};
+use crate::tasks::{self, Task};
 use crate::text::{age, duration, home_short, local_time, truncate};
 use anyhow::Result;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -26,6 +28,7 @@ pub enum Outcome {
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
     Sessions,
+    Tasks,
     Prs,
 }
 
@@ -33,16 +36,21 @@ struct App {
     sessions: Vec<SessionRow>,
     prs: Vec<PrEntry>,
     pr_by_key: HashMap<(String, u32), usize>,
-    hay: Vec<String>,
-    bodies: Vec<String>,
+    tasks: Vec<Task>,
+    corpus: Corpus,
     ranker: Ranker,
+    ctx: Option<Context>,
+    here_first: bool,
+    hide_quick: bool,
     query: String,
     tab: Tab,
     deep: bool,
     shown: Vec<usize>,
     pr_shown: Vec<usize>,
+    task_shown: Vec<usize>,
     list: ListState,
     pr_list: ListState,
+    task_list: ListState,
     preview_scroll: u16,
     status: String,
 }
@@ -62,21 +70,26 @@ const DIM: Style = Style::new().fg(Color::DarkGray);
 const BOLD: Style = Style::new().add_modifier(Modifier::BOLD);
 
 impl App {
-    fn new(db: &Db, initial: &str) -> Result<App> {
+    fn new(db: &Db, initial: &str, ctx: Option<Context>) -> Result<App> {
         let mut app = App {
             sessions: vec![],
             prs: vec![],
             pr_by_key: HashMap::new(),
-            hay: vec![],
-            bodies: vec![],
+            tasks: vec![],
+            corpus: Corpus::new(&[], None, vec![]),
             ranker: Ranker::default(),
+            here_first: ctx.is_some(),
+            ctx,
+            hide_quick: false,
             query: initial.to_string(),
             tab: Tab::Sessions,
             deep: false,
             shown: vec![],
             pr_shown: vec![],
+            task_shown: vec![],
             list: ListState::default(),
             pr_list: ListState::default(),
+            task_list: ListState::default(),
             preview_scroll: 0,
             status: String::new(),
         };
@@ -93,8 +106,9 @@ impl App {
             .enumerate()
             .map(|(i, p)| ((p.repo.clone(), p.number), i))
             .collect();
-        self.hay = self.sessions.iter().map(search::haystack).collect();
-        self.bodies = self.sessions.iter().map(search::body).collect();
+        let (tasks, task_of) = tasks::build(&self.sessions, &self.prs);
+        self.tasks = tasks;
+        self.corpus = Corpus::new(&self.sessions, self.ctx.as_ref(), task_of);
         self.refilter(db);
         Ok(())
     }
@@ -111,16 +125,23 @@ impl App {
                 .collect();
             ids.iter()
                 .filter_map(|id| pos.get(id.as_str()).copied())
-                .filter(|&i| {
-                    q.prs
-                        .iter()
-                        .all(|(r, n)| search::linked(&self.sessions[i], r.as_deref(), *n))
-                })
+                .filter(|&i| search::passes(&self.sessions[i], self.corpus.task_of[i], &q))
                 .collect()
         } else {
-            self.ranker
-                .rank(&self.sessions, &self.hay, &self.bodies, &q)
+            let opts = Opts {
+                here_first: self.here_first,
+                hide_quick: self.hide_quick,
+            };
+            self.ranker.rank(&self.sessions, &self.corpus, &q, opts)
         };
+        // Tasks follow the session ranking: a task shows up where its best session is.
+        let mut seen = vec![false; self.tasks.len()];
+        self.task_shown = self
+            .shown
+            .iter()
+            .filter_map(|&i| self.corpus.task_of[i])
+            .filter(|&t| !std::mem::replace(&mut seen[t], true))
+            .collect();
         let text = q.text.to_lowercase();
         self.pr_shown = (0..self.prs.len())
             .filter(|&i| {
@@ -144,6 +165,11 @@ impl App {
             .collect();
         self.list
             .select(if self.shown.is_empty() { None } else { Some(0) });
+        self.task_list.select(if self.task_shown.is_empty() {
+            None
+        } else {
+            Some(0)
+        });
         self.pr_list.select(if self.pr_shown.is_empty() {
             None
         } else {
@@ -159,6 +185,13 @@ impl App {
             .map(|&i| &self.sessions[i])
     }
 
+    fn selected_task(&self) -> Option<&Task> {
+        self.task_list
+            .selected()
+            .and_then(|i| self.task_shown.get(i))
+            .map(|&i| &self.tasks[i])
+    }
+
     fn selected_pr(&self) -> Option<&PrEntry> {
         self.pr_list
             .selected()
@@ -169,6 +202,7 @@ impl App {
     fn move_by(&mut self, d: i32) {
         let (state, len) = match self.tab {
             Tab::Sessions => (&mut self.list, self.shown.len()),
+            Tab::Tasks => (&mut self.task_list, self.task_shown.len()),
             Tab::Prs => (&mut self.pr_list, self.pr_shown.len()),
         };
         if len == 0 {
@@ -188,7 +222,7 @@ fn format_ref((repo, n): &(Option<String>, u32)) -> String {
 }
 
 pub fn run(db: &mut Db, cfg: &Config, initial: &str) -> Result<Outcome> {
-    let mut app = App::new(db, initial)?;
+    let mut app = App::new(db, initial, Context::detect())?;
     if app.sessions.is_empty() {
         app.status = format!(
             "No sessions found under {} — run Claude Code first, or set claude_projects_dir",
@@ -243,6 +277,18 @@ fn on_key(app: &mut App, k: KeyEvent, db: &mut Db, cfg: &Config) -> Result<Optio
                     }
                 }
             }
+            Tab::Tasks => {
+                if let Some(t) = app.selected_task() {
+                    let (id, title) = (t.id, t.title.clone());
+                    app.query = format!("task:{id}");
+                    app.tab = Tab::Sessions;
+                    app.refilter(db);
+                    app.status = format!(
+                        "Sessions of task \"{}\" — Enter to resume",
+                        truncate(&title, 50)
+                    );
+                }
+            }
             Tab::Prs => {
                 if let Some(p) = app.selected_pr() {
                     app.query = if p.repo.is_empty() {
@@ -256,13 +302,45 @@ fn on_key(app: &mut App, k: KeyEvent, db: &mut Db, cfg: &Config) -> Result<Optio
                 }
             }
         },
-        (KeyCode::Tab, _) | (KeyCode::BackTab, _) => {
-            app.tab = if app.tab == Tab::Sessions {
-                Tab::Prs
-            } else {
-                Tab::Sessions
+        (KeyCode::Tab, _) => {
+            app.tab = match app.tab {
+                Tab::Sessions => Tab::Tasks,
+                Tab::Tasks => Tab::Prs,
+                Tab::Prs => Tab::Sessions,
             };
             app.preview_scroll = 0;
+        }
+        (KeyCode::BackTab, _) => {
+            app.tab = match app.tab {
+                Tab::Sessions => Tab::Prs,
+                Tab::Tasks => Tab::Sessions,
+                Tab::Prs => Tab::Tasks,
+            };
+            app.preview_scroll = 0;
+        }
+        (KeyCode::Char('g'), true) => match &app.ctx {
+            None => {
+                app.status =
+                    "Not started inside a project, so there's no \"here\" to rank by.".into()
+            }
+            Some(c) => {
+                app.here_first = !app.here_first;
+                app.status = if app.here_first {
+                    format!("Sessions from {} first", c.label())
+                } else {
+                    "Global ranking: newest first, wherever they ran".into()
+                };
+                app.refilter(db);
+            }
+        },
+        (KeyCode::Char('t'), true) => {
+            app.hide_quick = !app.hide_quick;
+            app.status = if app.hide_quick {
+                "Hiding one-off quick sessions (1 prompt, no edits, no PRs)".into()
+            } else {
+                "Showing all sessions".into()
+            };
+            app.refilter(db);
         }
         (KeyCode::Up, _) | (KeyCode::Char('p'), true) | (KeyCode::Char('k'), true) => {
             app.move_by(-1)
@@ -317,6 +395,10 @@ fn on_key(app: &mut App, k: KeyEvent, db: &mut Db, cfg: &Config) -> Result<Optio
         (KeyCode::Char('b'), true) => {
             let url = match app.tab {
                 Tab::Prs => app.selected_pr().and_then(pr_url),
+                Tab::Tasks => app
+                    .selected_task()
+                    .and_then(|t| t.prs.first())
+                    .and_then(|&pi| pr_url(&app.prs[pi])),
                 Tab::Sessions => app.selected().and_then(|s| {
                     s.cloud_id
                         .as_ref()
@@ -397,9 +479,22 @@ fn draw(f: &mut Frame, app: &mut App) {
             Tab::Sessions,
             format!("Sessions {}/{}", app.shown.len(), app.sessions.len()),
         ),
+        tab(Tab::Tasks, format!("Tasks {}", app.task_shown.len())),
         tab(Tab::Prs, format!("PRs {}", app.pr_shown.len())),
         Span::raw("  "),
     ];
+    if let (Some(c), true) = (&app.ctx, app.here_first) {
+        head.push(Span::styled(
+            format!("◉ {} ", c.label()),
+            Style::new().fg(Color::Green),
+        ));
+    }
+    if app.hide_quick {
+        head.push(Span::styled(
+            "[quick hidden] ",
+            Style::new().fg(Color::Yellow),
+        ));
+    }
     if app.deep {
         head.push(Span::styled("[full-text] ", Style::new().fg(Color::Yellow)));
     }
@@ -410,10 +505,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     head.push(Span::raw(app.query.clone()));
     head.push(Span::styled("█", Style::new().fg(Color::Cyan)));
     if app.query.is_empty() {
-        head.push(Span::styled(
-            " type to search · #123 for a PR · ctrl-f full-text",
-            DIM,
-        ));
+        head.push(Span::styled(" search · #123 · p: b: f: @today has:pr", DIM));
     }
     f.render_widget(Paragraph::new(Line::from(head)), top);
 
@@ -430,6 +522,10 @@ fn draw(f: &mut Frame, app: &mut App) {
         Tab::Sessions => {
             draw_session_list(f, app, left);
             draw_session_preview(f, app, right);
+        }
+        Tab::Tasks => {
+            draw_task_list(f, app, left);
+            draw_task_preview(f, app, right);
         }
         Tab::Prs => {
             draw_pr_list(f, app, left);
@@ -454,13 +550,15 @@ fn draw(f: &mut Frame, app: &mut App) {
             Tab::Sessions => {
                 v.extend(k("enter", "resume"));
                 v.extend(k("^o", "new tab"));
-                v.extend(k("^y", "copy cmd"));
-                v.extend(k("^d", "AI describe"));
+                v.extend(k("^y", "copy"));
+                v.extend(k("^d", "describe"));
             }
-            Tab::Prs => v.extend(k("enter", "show its sessions")),
+            Tab::Tasks | Tab::Prs => v.extend(k("enter", "show its sessions")),
         }
-        v.extend(k("tab", "sessions/PRs"));
-        v.extend(k("^b", "browser"));
+        v.extend(k("tab", "view"));
+        v.extend(k("^g", "here/all"));
+        v.extend(k("^t", "hide quick"));
+        v.extend(k("^b", "web"));
         v.extend(k("^f", "full-text"));
         v.extend(k("←→", "scroll"));
         v.extend(k("esc", "quit"));
@@ -496,6 +594,12 @@ fn draw_session_list(f: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .map(|&i| {
             let s = &app.sessions[i];
+            let tier = if app.here_first {
+                app.corpus.tier[i]
+            } else {
+                0
+            };
+            let task = app.corpus.task_of[i].map(|t| app.tasks[t].sessions.len());
             let a = format!("{:>4} ", age(s.ended.as_deref().or(s.started.as_deref())));
             let mut l1 = vec![Span::styled(a, DIM)];
             let title_style = if s.missing { DIM } else { BOLD };
@@ -503,8 +607,13 @@ fn draw_session_list(f: &mut Frame, app: &mut App, area: Rect) {
                 truncate(&s.title(), width.saturating_sub(6)),
                 title_style,
             ));
+            let here = match tier {
+                crate::context::TIER_BRANCH => Span::styled("   ◉ ", Style::new().fg(Color::Green)),
+                crate::context::TIER_PLACE => Span::styled("   ○ ", Style::new().fg(Color::Green)),
+                _ => Span::raw("     "),
+            };
             let mut l2 = vec![
-                Span::raw("     "),
+                here,
                 Span::styled(s.project_name(), Style::new().fg(Color::Blue)),
             ];
             if let Some(b) = &s.branch {
@@ -520,6 +629,12 @@ fn draw_session_list(f: &mut Frame, app: &mut App, area: Rect) {
                 ));
             }
             l2.extend(pr_badges(s, 4));
+            if let Some(n) = task {
+                l2.push(Span::styled(
+                    format!("  ⋯ task of {n}"),
+                    Style::new().fg(Color::Yellow),
+                ));
+            }
             ListItem::new(Text::from(vec![Line::from(l1), Line::from(l2)]))
         })
         .collect();
@@ -605,6 +720,27 @@ fn draw_session_preview(f: &mut Frame, app: &App, area: Rect) {
     };
     lines.extend(wrap_lines(label, s.description(), Style::new()));
 
+    if let Some(t) = app.corpus.task_of[me].map(|t| &app.tasks[t]) {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::styled(
+                "Part of task ",
+                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(truncate(&t.title, 50), BOLD),
+            Span::styled(format!("  ({} sessions)", t.sessions.len()), DIM),
+        ]));
+        for &i in t.sessions.iter().filter(|&&i| i != me).take(4) {
+            let o = &app.sessions[i];
+            let when = if i < me { "later  " } else { "earlier" };
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {when} "), DIM),
+                Span::styled(format!("{} ", o.short_id()), Style::new().fg(Color::Blue)),
+                Span::styled(format!("{:>4} ", age(o.ended.as_deref())), DIM),
+                Span::raw(truncate(&o.title(), 48)),
+            ]));
+        }
+    }
     let sig = s.pr_summary();
     if !sig.is_empty() {
         lines.push(Line::raw(""));
@@ -841,6 +977,155 @@ fn draw_pr_preview(f: &mut Frame, app: &App, area: Rect) {
             DIM,
         )));
     }
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((app.preview_scroll, 0)),
+        pad(area),
+    );
+}
+
+fn draw_task_list(f: &mut Frame, app: &mut App, area: Rect) {
+    let width = area.width.saturating_sub(4) as usize;
+    let items: Vec<ListItem> = app
+        .task_shown
+        .iter()
+        .map(|&ti| {
+            let t = &app.tasks[ti];
+            let newest = &app.sessions[t.sessions[0]];
+            let l1 = vec![
+                Span::styled(format!("{:>4} ", age(newest.ended.as_deref())), DIM),
+                Span::styled(truncate(&t.title, width.saturating_sub(6)), BOLD),
+            ];
+            let here = t
+                .sessions
+                .iter()
+                .map(|&i| app.corpus.tier[i])
+                .max()
+                .unwrap_or(0);
+            let mut l2 = vec![
+                Span::styled(
+                    if app.here_first && here > 0 {
+                        "   ◉ "
+                    } else {
+                        "     "
+                    },
+                    Style::new().fg(Color::Green),
+                ),
+                Span::styled(t.project.clone(), Style::new().fg(Color::Blue)),
+            ];
+            if let Some(b) = &t.branch {
+                l2.push(Span::styled(format!(" ⎇ {}", truncate(b, 26)), DIM));
+            }
+            l2.push(Span::styled(
+                format!(" · {} sessions", t.sessions.len()),
+                Style::new().fg(Color::Yellow),
+            ));
+            for &pi in t.prs.iter().take(3) {
+                let p = &app.prs[pi];
+                let role = p
+                    .links
+                    .iter()
+                    .filter(|l| l.session.is_some_and(|i| t.sessions.contains(&i)))
+                    .map(|l| l.role)
+                    .min();
+                if let Some(r) = role {
+                    l2.push(Span::styled(
+                        format!(" {}#{}", r.icon(), p.number),
+                        Style::new().fg(role_color(r)),
+                    ));
+                }
+            }
+            ListItem::new(Text::from(vec![Line::from(l1), Line::from(l2)]))
+        })
+        .collect();
+    let list = List::new(items)
+        .block(Block::new().borders(Borders::RIGHT).border_style(DIM))
+        .highlight_style(Style::new().bg(Color::Indexed(236)))
+        .highlight_symbol("▌")
+        .highlight_spacing(HighlightSpacing::Always);
+    f.render_stateful_widget(list, area, &mut app.task_list);
+}
+
+fn draw_task_preview(f: &mut Frame, app: &App, area: Rect) {
+    let Some(t) = app.selected_task() else {
+        let msg = if app.tasks.is_empty() {
+            "  No tasks yet. Sessions are grouped into a task when they work on\n  the same branch or the same PR."
+        } else {
+            "  No matching tasks."
+        };
+        f.render_widget(Paragraph::new(Text::styled(msg, DIM)), area);
+        return;
+    };
+    let mut lines = vec![
+        Line::from(Span::styled(t.title.clone(), BOLD.fg(Color::White))),
+        Line::from(vec![
+            Span::styled(t.project.clone(), Style::new().fg(Color::Blue)),
+            Span::styled(
+                t.branch
+                    .as_ref()
+                    .map(|b| format!("  ⎇ {b}"))
+                    .unwrap_or_default(),
+                DIM,
+            ),
+        ]),
+    ];
+    for &pi in &t.prs {
+        let p = &app.prs[pi];
+        lines.push(Line::from(vec![
+            Span::styled(format!("{} ", p.key()), BOLD),
+            Span::styled(
+                p.state().map(|s| format!("[{s}] ")).unwrap_or_default(),
+                DIM,
+            ),
+            Span::styled(p.story(&app.sessions), Style::new().fg(Color::Yellow)),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        format!("Sessions ({}), oldest first", t.sessions.len()),
+        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )));
+    for &i in t.sessions.iter().rev() {
+        let s = &app.sessions[i];
+        let roles: Vec<Span> = t
+            .prs
+            .iter()
+            .filter_map(|&pi| {
+                let p = &app.prs[pi];
+                let r = p
+                    .links
+                    .iter()
+                    .filter(|l| l.session == Some(i))
+                    .map(|l| l.role)
+                    .min()?;
+                r.is_significant().then(|| {
+                    Span::styled(
+                        format!(" {} {} #{}", r.icon(), r.as_str(), p.number),
+                        Style::new().fg(role_color(r)),
+                    )
+                })
+            })
+            .collect();
+        let mut l = vec![
+            Span::styled(format!("{} ", s.short_id()), Style::new().fg(Color::Blue)),
+            Span::styled(format!("{}  ", local_time(s.started.as_deref())), DIM),
+            Span::raw(truncate(&s.title(), 50)),
+        ];
+        l.extend(roles);
+        lines.push(Line::from(l));
+        if let Some(d) = s.description().lines().find(|l| !l.starts_with("Asked:")) {
+            lines.push(Line::from(Span::styled(
+                format!("          {}", truncate(d, 80)),
+                DIM,
+            )));
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Enter lists these sessions; the newest is selected.",
+        DIM,
+    )));
     f.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })

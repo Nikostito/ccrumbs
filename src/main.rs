@@ -2,6 +2,7 @@
 //! created or reviewed, then jump straight back into it.
 
 mod config;
+mod context;
 mod db;
 mod describe;
 mod github;
@@ -12,6 +13,7 @@ mod parse;
 mod prdetect;
 mod prview;
 mod search;
+mod tasks;
 mod text;
 mod tui;
 
@@ -43,6 +45,7 @@ enum Cmd {
     /// Open the picker (default). Optional initial query, e.g. `cctrail pick #42`.
     Pick { query: Vec<String> },
     /// Jump straight into the best match; opens the picker if it's ambiguous.
+    /// With no query, continues the latest session from the repo/branch you're in.
     Go {
         /// Session id prefix, PR ref (#42, owner/repo#42, URL) or search words.
         query: Vec<String>,
@@ -50,8 +53,10 @@ enum Cmd {
         #[arg(long)]
         print: bool,
     },
-    /// List recent sessions with descriptions.
+    /// List recent sessions with descriptions. Takes the same filters as the picker.
     List {
+        /// Optional query: words, #PR, p:project, b:branch, f:file, @today, @3d, has:pr ...
+        query: Vec<String>,
         #[arg(short = 'n', long, default_value_t = 20)]
         limit: usize,
         /// Only sessions whose project path contains this.
@@ -60,6 +65,11 @@ enum Cmd {
         /// One line per session (no description).
         #[arg(short, long)]
         short: bool,
+    },
+    /// Sessions grouped by task (same branch or same PR).
+    Tasks {
+        #[arg(short = 'n', long, default_value_t = 15)]
+        limit: usize,
     },
     /// Full-text search over every prompt, reply and command.
     Search {
@@ -204,18 +214,38 @@ fn real_main() -> Result<()> {
         Cmd::Pick { query } => pick(&mut db, &cfg, &query.join(" ")),
         Cmd::Go { query, print } => go(&mut db, &cfg, &query.join(" "), print),
         Cmd::List {
+            query,
             limit,
             project,
             short,
         } => {
             let sessions = db.load_sessions()?;
-            let iter = sessions.iter().filter(|s| {
-                project
-                    .as_ref()
-                    .is_none_or(|pr| s.resume_dir().contains(pr.as_str()))
-            });
-            for s in iter.take(limit) {
-                print_row(&p, s, !short);
+            let mut q = search::parse(&query.join(" "));
+            q.project.extend(project.map(|p| p.to_lowercase()));
+            let prs = prview::build(&sessions, &db.load_prs()?);
+            let (_, task_of) = tasks::build(&sessions, &prs);
+            let corpus = search::Corpus::new(&sessions, None, task_of);
+            let hits =
+                search::Ranker::default().rank(&sessions, &corpus, &q, search::Opts::default());
+            if hits.is_empty() {
+                println!("No matching sessions.");
+            }
+            for i in hits.into_iter().take(limit) {
+                print_row(&p, &sessions[i], !short);
+            }
+            Ok(())
+        }
+        Cmd::Tasks { limit } => {
+            let sessions = db.load_sessions()?;
+            let prs = prview::build(&sessions, &db.load_prs()?);
+            let (tasks, _) = tasks::build(&sessions, &prs);
+            if tasks.is_empty() {
+                println!(
+                    "No tasks yet: sessions are grouped when they work on the same branch or the same PR."
+                );
+            }
+            for t in tasks.iter().take(limit) {
+                print_task(&p, t, &sessions, &prs);
             }
             Ok(())
         }
@@ -351,6 +381,9 @@ fn config_cmd(cmd: Cmd, cfg: &mut Config) -> Result<()> {
 }
 
 fn pick(db: &mut Db, cfg: &Config, query: &str) -> Result<()> {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        bail!("the picker needs a terminal; try `cctrail list` or `cctrail go <query> --print`");
+    }
     match tui::run(db, cfg, query)? {
         tui::Outcome::Resume(s) => launch::resume_here(&s),
         tui::Outcome::Quit => Ok(()),
@@ -368,7 +401,26 @@ fn go(db: &mut Db, cfg: &Config, query: &str, print: bool) -> Result<()> {
         }
     };
     if query.trim().is_empty() {
-        return pick(db, cfg, "");
+        // No query: continue the latest session from here (this branch first, then this repo).
+        let ctx = context::Context::detect();
+        let best = ctx.as_ref().and_then(|c| {
+            let tier = |s: &SessionRow| c.tier(s);
+            sessions
+                .iter()
+                .filter(|s| !s.missing && tier(s) > 0)
+                .max_by_key(|s| (tier(s), s.ended.clone()))
+        });
+        return match best {
+            Some(s) => {
+                eprintln!(
+                    "Latest session in {}: {}",
+                    ctx.map(|c| c.label()).unwrap_or_default(),
+                    s.title()
+                );
+                run(s)
+            }
+            None => pick(db, cfg, ""),
+        };
     }
     // 1. Session id prefix.
     let by_id = search::by_id(&sessions, query);
@@ -405,9 +457,15 @@ fn go(db: &mut Db, cfg: &Config, query: &str, print: bool) -> Result<()> {
         }
     }
     // 3. Search; resume only when there's exactly one hit.
-    let hay: Vec<String> = sessions.iter().map(search::haystack).collect();
-    let bodies: Vec<String> = sessions.iter().map(search::body).collect();
-    let hits = search::Ranker::default().rank(&sessions, &hay, &bodies, &q);
+    let prs = prview::build(&sessions, &db.load_prs()?);
+    let (_, task_of) = tasks::build(&sessions, &prs);
+    let ctx = context::Context::detect();
+    let corpus = search::Corpus::new(&sessions, ctx.as_ref(), task_of);
+    let opts = search::Opts {
+        here_first: true,
+        hide_quick: false,
+    };
+    let hits = search::Ranker::default().rank(&sessions, &corpus, &q, opts);
     if hits.len() == 1 {
         return run(&sessions[hits[0]]);
     }
@@ -611,6 +669,57 @@ fn show(p: &Paint, s: &SessionRow, sessions: &[SessionRow], prs: &[PrEntry]) {
         println!("Resume: {}", p.bold(launch::resume_command(s)));
     }
     println!("{}", p.dim(format!("Transcript: {}", s.path)));
+}
+
+fn print_task(p: &Paint, t: &tasks::Task, sessions: &[SessionRow], prs: &[PrEntry]) {
+    let branch = t
+        .branch
+        .as_ref()
+        .map(|b| format!(" ⎇ {b}"))
+        .unwrap_or_default();
+    println!(
+        "{}  {}{}  {}",
+        p.bold(truncate(&t.title, 60)),
+        p.c("34", &t.project),
+        p.dim(branch),
+        p.c("33", format!("{} sessions", t.sessions.len()))
+    );
+    for &pi in &t.prs {
+        println!(
+            "    {} {}",
+            p.bold(prs[pi].key()),
+            p.dim(prs[pi].story(sessions))
+        );
+    }
+    for &i in t.sessions.iter().rev() {
+        let s = &sessions[i];
+        let roles: Vec<String> = t
+            .prs
+            .iter()
+            .filter_map(|&pi| {
+                let r = prs[pi]
+                    .links
+                    .iter()
+                    .filter(|l| l.session == Some(i))
+                    .map(|l| l.role)
+                    .min()?;
+                r.is_significant().then(|| {
+                    p.role(
+                        r,
+                        format!("{} {} #{}", r.icon(), r.as_str(), prs[pi].number),
+                    )
+                })
+            })
+            .collect();
+        println!(
+            "    {}  {}  {}  {}",
+            p.c("34", s.short_id()),
+            p.dim(local_time(s.started.as_deref())),
+            truncate(&s.title(), 50),
+            roles.join(" ")
+        );
+    }
+    println!();
 }
 
 fn print_pr_row(p: &Paint, e: &PrEntry, sessions: &[SessionRow]) {

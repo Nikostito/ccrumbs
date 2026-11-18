@@ -102,7 +102,7 @@ pub fn scan(cfg: &Config) -> Vec<Found> {
 }
 
 /// `owner/repo` of the `origin` remote in `dir`, if it's a GitHub repo.
-fn git_repo(dir: &str) -> Option<String> {
+pub fn git_repo(dir: &str) -> Option<String> {
     if !Path::new(dir).is_dir() {
         return None;
     }
