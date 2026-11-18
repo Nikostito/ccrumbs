@@ -3,26 +3,7 @@
 Find a Claude Code session in seconds, see what it did and which PRs it
 **created** or **reviewed**, and jump straight back into it.
 
-```
- Sessions 4/4  PRs 3   ❯ █ type to search · #123 for a PR · ctrl-f full-text
-   5d what changed in https://github.com/acme/web/pu…   │ Rust rewrite of the session indexer
-      web ⎇ main                                        │ /work/acme/web  ⎇ feat/rust-indexer
-   6d Fix flaky login test                              │ 2026-11-10 09:00 · 2 prompts · 1h04m · 1k out ·
-      web ⎇ claude/fix-login ☁ ●#13                     │ claude-opus-5-5
-   7d /review 12                                        │ id aaaa1111-0000-4000-8000-000000000001
-      web ⎇ main ◆#12                                   │
-▌  8d Rust rewrite of the session indexer               │ Description
-      web ⎇ feat/rust-indexer ●#12                      │ Asked: Rewrite the indexer in Rust for speed, keep the
-                                                        │ SQLite schema
-                                                        │ Then: looks good, commit and open a PR
-                                                        │ Edited 2 files: index.rs, Cargo.toml · ran tests · 1 commit
-                                                        │ Opened PR #12
-                                                        │
-                                                        │ Pull requests
-                                                        │  ● CREATED   acme/web#12 Rewrite indexer in Rust
-                                                        │      ↳ reviewed in another session: bbbb2222 "/review 12"
-enter resume  ^o new tab  ^y copy cmd  ^d AI describe  tab sessions/PRs  ^b browser  ^f full-text  ←→ scroll  esc quit
-```
+![cctrail: session list with descriptions and PR badges](docs/sessions.png)
 
 Type a few words (or `#123` for a PR), press **Enter**, and you're back in
 that session: cctrail `cd`s into its directory and runs
@@ -41,25 +22,10 @@ that session: cctrail `cd`s into its directory and runs
   Failed commands and text inside heredocs or quoted strings don't count.
 - **PR lookup by number.** `cctrail pr 42` (or `#42`, `owner/repo#42`, or a
   PR URL) lists every session that touched the PR and says how.
-- **Created by one session, reviewed by another, stated plainly:**
+- **Created by one session, reviewed by another, stated plainly.** The PRs
+  tab tells each PR's story:
 
-```
-acme/web#12  [open]
-Rewrite indexer in Rust
-https://github.com/acme/web/pull/12
-Born from a Claude session
-
-Created by aaaa1111 "Rust rewrite of the session indexer" · reviewed by a DIFFERENT session: bbbb2222 "/review 12"
-
-  ● CREATED    aaaa1111  2026-11-10 10:03  Rust rewrite of the session indexer
-               /work/acme/web · gh pr create
-  ◆ REVIEWED   bbbb2222  2026-11-11 14:00  /review 12
-               /work/acme/web · you asked: /review 12 (also viewed)
-  · MENTIONED  dddd4444  2026-11-13 16:00  what changed in https://github.com/acme/web/pull/12 ?
-               /work/acme/web · mentioned in a prompt
-
-Jump in: cctrail go aaaa1111
-```
+  ![PRs tab: who created and who reviewed each PR](docs/prs-tab.png)
 
   You'll see one of: *"Created by A · reviewed by a DIFFERENT session: B"*,
   *"Created and reviewed in the SAME session"*, or *"Reviewed by B · created
@@ -97,7 +63,18 @@ Or, from a clone, run `cargo install --path . --locked`. That puts a single
 Session ids can be abbreviated to their first few characters, like git
 hashes.
 
+![cctrail pr 88 and cctrail prs --claude](docs/cli-pr.png)
+
 ### Picker keys
+
+Typing `#88` keeps only the sessions linked to that PR, with the one that
+created it first:
+
+![Searching #88 in the picker](docs/search-pr.png)
+
+Plain words match titles, projects, branches, descriptions and prompts:
+
+![Searching "leak" in the picker](docs/search-text.png)
 
 | Key | Action |
 |---|---|
