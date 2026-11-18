@@ -17,6 +17,25 @@ pub struct Config {
     pub describe_model: String,
     /// Override context windows: model-id substring -> tokens, e.g. {"sonnet-4-5": 1000000}.
     pub context_windows: std::collections::BTreeMap<String, u64>,
+    /// Ticket prefix -> URL with `{key}`, e.g. {"ABC": "https://acme.atlassian.net/browse/{key}",
+    /// "ENG": "https://linear.app/acme/issue/{key}"}. `"*"` applies to any prefix.
+    pub tickets: std::collections::BTreeMap<String, String>,
+}
+
+static TICKETS: std::sync::OnceLock<std::collections::BTreeMap<String, String>> =
+    std::sync::OnceLock::new();
+
+/// Configured ticket templates (empty until `Config::load`).
+pub fn ticket_templates() -> &'static std::collections::BTreeMap<String, String> {
+    static EMPTY: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    TICKETS.get().unwrap_or(&EMPTY)
+}
+
+/// Browser URL for a ticket key, if a template is configured for its prefix.
+pub fn ticket_url(key: &str) -> Option<String> {
+    let t = ticket_templates();
+    let tpl = t.get(crate::tickets::prefix(key)).or_else(|| t.get("*"))?;
+    Some(tpl.replace("{key}", key))
 }
 
 static OVERRIDES: std::sync::OnceLock<std::collections::BTreeMap<String, u64>> =
@@ -38,6 +57,7 @@ impl Default for Config {
             ignored_projects: vec![],
             describe_model: DEFAULT_MODEL.into(),
             context_windows: Default::default(),
+            tickets: Default::default(),
         }
     }
 }
@@ -67,6 +87,7 @@ impl Config {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
         let _ = OVERRIDES.set(cfg.context_windows.clone());
+        let _ = TICKETS.set(cfg.tickets.clone());
         cfg
     }
 

@@ -7,6 +7,8 @@
 //! - `@today`, `@yesterday`, `@week`, `@month`, `@3d`, `@2w`, `@12h`: last activity
 //! - `has:pr`: sessions that created/reviewed/... a PR
 //! - `task:N`: sessions of task N (what the Tasks tab uses)
+//! - `t:ABC-123` / a bare `ABC-123`: sessions linked to that ticket
+//! - `is:pinned`, `is:hidden` (hidden sessions are left out otherwise), `has:note`
 
 use crate::context::Context;
 use crate::model::SessionRow;
@@ -29,6 +31,10 @@ pub struct Query {
     /// `ctx:>80` / `ctx:<30` (`ctx:80` means at least 80%).
     pub ctx_min: Option<u32>,
     pub ctx_max: Option<u32>,
+    pub tickets: Vec<String>,
+    pub pinned: bool,
+    pub hidden: bool,
+    pub has_note: bool,
 }
 
 fn start_of_day(days_ago: i64) -> DateTime<Utc> {
@@ -97,6 +103,17 @@ pub fn parse(q: &str) -> Query {
             } else if let Some(n) = num(&v) {
                 out.ctx_min = Some(n);
             }
+        } else if let Some(v) = val(&["t:", "ticket:"]) {
+            out.tickets.push(v.to_uppercase());
+        } else if lw == "is:pinned" || lw == "is:pin" {
+            out.pinned = true;
+        } else if lw == "is:hidden" {
+            out.hidden = true;
+        } else if lw == "has:note" {
+            out.has_note = true;
+        } else if crate::tickets::from_text(w).first().is_some_and(|k| k == w) {
+            // An exact `ABC-123` typed on its own.
+            out.tickets.push(w.to_string());
         } else if lw == "has:pr" || lw == "has:prs" {
             out.has_pr = true;
         } else if let Some((since, until)) = lw.strip_prefix('@').and_then(parse_age) {
@@ -131,13 +148,18 @@ pub fn haystack(s: &SessionRow) -> String {
     for l in s.prs.iter().filter(|l| l.role.is_significant()) {
         h.push_str(&format!(" #{}", l.number));
     }
+    for t in &s.tickets {
+        h.push(' ');
+        h.push_str(t);
+    }
     h
 }
 
 /// Longer text searched by plain substring when the fuzzy match misses.
 pub fn body(s: &SessionRow) -> String {
     format!(
-        "{}\n{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        s.note.as_deref().unwrap_or(""),
         s.description(),
         s.auto_desc,
         s.first_prompt.as_deref().unwrap_or(""),
@@ -235,6 +257,19 @@ pub fn passes(s: &SessionRow, task: Option<usize>, q: &Query) -> bool {
     if q.task.is_some() && q.task != task {
         return false;
     }
+    if s.hidden != q.hidden {
+        return false;
+    }
+    if (q.pinned && !s.pinned) || (q.has_note && s.note.is_none()) {
+        return false;
+    }
+    if !q
+        .tickets
+        .iter()
+        .all(|t| s.tickets.iter().any(|k| k.eq_ignore_ascii_case(t)))
+    {
+        return false;
+    }
     if q.ctx_min.is_some() || q.ctx_max.is_some() {
         let Some(pct) = s.context_pct() else {
             return false;
@@ -286,6 +321,12 @@ impl Ranker {
                 continue;
             }
             let here = if o.here_first { c.tier[i] as u32 } else { 0 };
+            // Pinned sessions float to the top of the default view.
+            let pin = if s.pinned && q.text.is_empty() && q.prs.is_empty() {
+                1_000_000
+            } else {
+                0
+            };
             if q.text.is_empty() {
                 // PR query: creator first, then reviewer, ...; then sessions from here; then recency.
                 let role = q
@@ -295,7 +336,7 @@ impl Ranker {
                     .min()
                     .map(|r| 10 - r as u32)
                     .unwrap_or(0);
-                scored.push((role * 10 + here, i));
+                scored.push((pin + role * 10 + here, i));
                 continue;
             }
             let fuzzy = pat
@@ -384,6 +425,9 @@ mod tests {
         assert!(q.has_pr && q.since.is_some());
         assert_eq!(q.prs, vec![(None, 88)]);
         assert_eq!(q.text, "bucket");
+        let q = parse("ABC-12 t:eng-3 is:pinned");
+        assert_eq!(q.tickets, vec!["ABC-12", "ENG-3"]);
+        assert!(q.pinned);
         let q = parse("ctx:>80 ctx:<95");
         assert_eq!((q.ctx_min, q.ctx_max), (Some(80), Some(95)));
     }

@@ -9,15 +9,213 @@ use crate::prview::{self, Actor, PrEntry};
 use crate::search::{self, Corpus, Opts, Ranker};
 use crate::tasks::{self, Task};
 use crate::text::{age, duration, home_short, local_time, truncate};
+use crate::transcript::{self, Entry, Kind};
 use anyhow::Result;
+use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, Borders, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
+    Block, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
 };
-use ratatui::{DefaultTerminal, Frame};
+use ratatui::{Frame, Terminal};
+
+/// The TUI draws on stderr, so stdout stays free for `pick --print` / `--print-dir`
+/// (shell helpers capture it with `$(...)`).
+type Term = Terminal<CrosstermBackend<std::io::Stderr>>;
+
+fn term_enter() -> Result<Term> {
+    use ratatui::crossterm::{execute, terminal};
+    terminal::enable_raw_mode()?;
+    execute!(std::io::stderr(), terminal::EnterAlternateScreen)?;
+    Ok(Terminal::new(CrosstermBackend::new(std::io::stderr()))?)
+}
+
+fn term_leave() {
+    use ratatui::crossterm::{cursor, execute, terminal};
+    let _ = terminal::disable_raw_mode();
+    let _ = execute!(
+        std::io::stderr(),
+        terminal::LeaveAlternateScreen,
+        cursor::Show
+    );
+}
+
+/// What a key press asks the event loop to do.
+enum Step {
+    Stay,
+    Exit(Outcome),
+    /// Leave the screen, run this (a terminal editor), come back.
+    Suspend(std::process::Command),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Action {
+    View,
+    OpenPr,
+    OpenTicket,
+    OpenCloud,
+    Editor,
+    Export,
+    Pin,
+    Note,
+    Hide,
+    Describe,
+    NewTab,
+    CopyCmd,
+    CopyId,
+}
+
+const MENU: &[(char, Action, &str)] = &[
+    ('v', Action::View, "view the conversation"),
+    ('b', Action::OpenPr, "open its PR in the browser"),
+    ('k', Action::OpenTicket, "open its Jira / Linear ticket"),
+    ('w', Action::OpenCloud, "open the claude.ai session"),
+    ('e', Action::Editor, "open the project in your editor"),
+    ('m', Action::Export, "export as Markdown"),
+    ('p', Action::Pin, "pin / unpin"),
+    ('n', Action::Note, "add / edit a note"),
+    ('h', Action::Hide, "hide / unhide"),
+    ('d', Action::Describe, "describe with Claude"),
+    ('o', Action::NewTab, "resume in a new terminal tab"),
+    ('y', Action::CopyCmd, "copy the resume command"),
+    ('c', Action::CopyId, "copy the session id"),
+];
+
+/// Full-screen conversation reader.
+struct Viewer {
+    session: SessionRow,
+    entries: Vec<Entry>,
+    rows: Vec<(Style, String)>,
+    width: u16,
+    outputs: bool,
+    scroll: usize,
+    height: usize,
+    input: Option<String>,
+    find: String,
+}
+
+fn wrap(s: &str, width: usize) -> Vec<String> {
+    let width = width.max(10);
+    let mut out = Vec::new();
+    for line in s.lines() {
+        let chars: Vec<char> = line.chars().collect();
+        if chars.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut start = 0;
+        while start < chars.len() {
+            let mut end = (start + width).min(chars.len());
+            if end < chars.len() {
+                if let Some(sp) = chars[start..end].iter().rposition(|c| *c == ' ') {
+                    if sp > width / 3 {
+                        end = start + sp + 1;
+                    }
+                }
+            }
+            out.push(
+                chars[start..end]
+                    .iter()
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string(),
+            );
+            start = end;
+        }
+    }
+    out
+}
+
+impl Viewer {
+    fn new(session: SessionRow) -> Viewer {
+        let entries = transcript::load(&session.path);
+        Viewer {
+            session,
+            entries,
+            rows: vec![],
+            width: 0,
+            outputs: false,
+            scroll: 0,
+            height: 20,
+            input: None,
+            find: String::new(),
+        }
+    }
+
+    fn rebuild(&mut self, width: u16) {
+        self.width = width;
+        let w = width.saturating_sub(2) as usize;
+        let mut rows: Vec<(Style, String)> = Vec::new();
+        for e in &self.entries {
+            let when = local_time(e.ts.as_deref());
+            match e.kind {
+                Kind::User => {
+                    rows.push((Style::new(), String::new()));
+                    rows.push((
+                        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                        format!("▶ You · {when}"),
+                    ));
+                    rows.extend(
+                        wrap(&e.text, w)
+                            .into_iter()
+                            .map(|l| (Style::new().fg(Color::White), l)),
+                    );
+                }
+                Kind::Assistant => {
+                    rows.push((Style::new(), String::new()));
+                    rows.push((
+                        Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+                        "◀ Claude".to_string(),
+                    ));
+                    rows.extend(wrap(&e.text, w).into_iter().map(|l| (Style::new(), l)));
+                }
+                Kind::Tool => rows.push((
+                    Style::new().fg(Color::Yellow),
+                    format!("  ⚙ {}", truncate(&e.text, w.saturating_sub(4))),
+                )),
+                Kind::Output | Kind::Error if self.outputs => {
+                    let st = if e.kind == Kind::Error {
+                        Style::new().fg(Color::Red)
+                    } else {
+                        DIM
+                    };
+                    for l in e.text.lines().take(12) {
+                        rows.push((st, format!("    │ {}", truncate(l, w.saturating_sub(6)))));
+                    }
+                }
+                Kind::Meta => rows.push((Style::new().fg(Color::Magenta), e.text.clone())),
+                _ => {}
+            }
+        }
+        if rows.is_empty() {
+            rows.push((DIM, "(this transcript has no readable messages)".into()));
+        }
+        self.rows = rows;
+        self.scroll = self.scroll.min(self.rows.len().saturating_sub(1));
+    }
+
+    fn find_next(&mut self, forward: bool) -> bool {
+        let q = self.find.to_lowercase();
+        if q.is_empty() {
+            return false;
+        }
+        let n = self.rows.len();
+        for k in 1..=n {
+            let i = if forward {
+                (self.scroll + 2 + k) % n
+            } else {
+                (self.scroll + 2 + n * 2 - k) % n
+            };
+            if self.rows[i].1.to_lowercase().contains(&q) {
+                self.scroll = i.saturating_sub(2);
+                return true;
+            }
+        }
+        false
+    }
+}
 use std::collections::HashMap;
 
 pub enum Outcome {
@@ -53,6 +251,10 @@ struct App {
     task_list: ListState,
     preview_scroll: u16,
     status: String,
+    viewer: Option<Viewer>,
+    menu: bool,
+    /// Note being edited for the target session.
+    note_input: Option<(String, String)>,
 }
 
 pub fn role_color(r: Role) -> Color {
@@ -100,6 +302,9 @@ impl App {
             task_list: ListState::default(),
             preview_scroll: 0,
             status: String::new(),
+            viewer: None,
+            menu: false,
+            note_input: None,
         };
         app.reload(db)?;
         Ok(app)
@@ -237,18 +442,18 @@ pub fn run(db: &mut Db, cfg: &Config, initial: &str) -> Result<Outcome> {
             cfg.projects_dir().display()
         );
     }
-    let mut term = ratatui::init();
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        term_leave();
+        hook(info);
+    }));
+    let mut term = term_enter()?;
     let res = event_loop(&mut term, &mut app, db, cfg);
-    ratatui::restore();
+    term_leave();
     res
 }
 
-fn event_loop(
-    term: &mut DefaultTerminal,
-    app: &mut App,
-    db: &mut Db,
-    cfg: &Config,
-) -> Result<Outcome> {
+fn event_loop(term: &mut Term, app: &mut App, db: &mut Db, cfg: &Config) -> Result<Outcome> {
     loop {
         term.draw(|f| draw(f, app))?;
         let Event::Key(k) = event::read()? else {
@@ -257,20 +462,357 @@ fn event_loop(
         if k.kind != KeyEventKind::Press {
             continue;
         }
-        if let Some(out) = on_key(app, k, db, cfg)? {
-            return Ok(out);
+        match on_key(app, k, db, cfg)? {
+            Step::Stay => {}
+            Step::Exit(out) => return Ok(out),
+            Step::Suspend(mut cmd) => {
+                term_leave();
+                let res = cmd.status();
+                *term = term_enter()?;
+                term.clear()?;
+                app.status = match res {
+                    Ok(st) if st.success() => "Back from the editor".into(),
+                    Ok(st) => format!("Editor exited with {st}"),
+                    Err(e) => format!("Could not start the editor: {e}"),
+                };
+            }
         }
     }
 }
 
-fn on_key(app: &mut App, k: KeyEvent, db: &mut Db, cfg: &Config) -> Result<Option<Outcome>> {
+impl App {
+    /// The session an action applies to: the selected one, a task's newest session,
+    /// or the session that created the selected PR.
+    fn target(&self) -> Option<&SessionRow> {
+        match self.tab {
+            Tab::Sessions => self.selected(),
+            Tab::Tasks => self.selected_task().map(|t| &self.sessions[t.sessions[0]]),
+            Tab::Prs => self
+                .selected_pr()
+                .and_then(|p| p.links.iter().find_map(|l| l.session))
+                .map(|i| &self.sessions[i]),
+        }
+    }
+
+    /// URL of the PR most relevant to the current selection.
+    fn target_pr_url(&self) -> Option<String> {
+        match self.tab {
+            Tab::Prs => self.selected_pr().and_then(pr_url),
+            Tab::Tasks => self
+                .selected_task()
+                .and_then(|t| t.prs.first())
+                .and_then(|&pi| pr_url(&self.prs[pi])),
+            Tab::Sessions => {
+                let s = self.selected()?;
+                let (l, _) = s
+                    .pr_summary()
+                    .into_iter()
+                    .find(|(l, _)| l.role.is_significant())?;
+                match self.pr_by_key.get(&(l.repo.clone(), l.number)) {
+                    Some(&pi) => pr_url(&self.prs[pi]),
+                    None => (!l.repo.is_empty())
+                        .then(|| format!("https://github.com/{}/pull/{}", l.repo, l.number)),
+                }
+            }
+        }
+    }
+
+    fn target_ticket(&self) -> Option<String> {
+        match self.tab {
+            Tab::Tasks => self
+                .selected_task()
+                .and_then(|t| t.tickets.first().cloned()),
+            _ => self.target().and_then(|s| s.tickets.first().cloned()),
+        }
+    }
+
+    /// Reload after changing marks, keeping the selection where it was.
+    fn reload_keep(&mut self, db: &Db) -> Result<()> {
+        let (a, b, c) = (
+            self.list.selected(),
+            self.task_list.selected(),
+            self.pr_list.selected(),
+        );
+        self.reload(db)?;
+        let clamp = |sel: Option<usize>, len: usize| {
+            sel.map(|i| i.min(len.saturating_sub(1)))
+                .filter(|_| len > 0)
+        };
+        self.list.select(clamp(a, self.shown.len()));
+        self.task_list.select(clamp(b, self.task_shown.len()));
+        self.pr_list.select(clamp(c, self.pr_shown.len()));
+        Ok(())
+    }
+}
+
+fn open(app: &mut App, url: Option<String>, what: &str) {
+    app.status = match url {
+        Some(u) => match launch::open_url(&u) {
+            Ok(()) => format!("Opened {u}"),
+            Err(e) => format!("{e}"),
+        },
+        None => format!("No {what} for this selection"),
+    };
+}
+
+fn do_action(app: &mut App, a: Action, db: &mut Db, cfg: &Config) -> Result<Step> {
+    match a {
+        Action::OpenPr => {
+            let url = app.target_pr_url();
+            open(app, url, "PR");
+        }
+        Action::OpenTicket => match app.target_ticket() {
+            None => app.status = "No ticket key (like ABC-123) found for this selection".into(),
+            Some(key) => match crate::config::ticket_url(&key) {
+                Some(u) => open(app, Some(u), "ticket"),
+                None => {
+                    app.status = format!(
+                        "{key}: add \"tickets\": {{\"{}\": \"https://…/browse/{{key}}\"}} to {}",
+                        crate::tickets::prefix(&key),
+                        crate::config::config_path().display()
+                    )
+                }
+            },
+        },
+        Action::OpenCloud => {
+            let url = app.target().and_then(|s| {
+                s.cloud_id
+                    .as_ref()
+                    .map(|c| format!("https://claude.ai/code/{c}"))
+            });
+            open(app, url, "claude.ai session");
+        }
+        Action::View => {
+            if let Some(s) = app.target().cloned() {
+                if !std::path::Path::new(&s.path).exists() {
+                    app.status = "The transcript file is gone (Claude Code retention).".into();
+                } else {
+                    app.viewer = Some(Viewer::new(s));
+                }
+            }
+        }
+        Action::Editor => {
+            if let Some(s) = app.target() {
+                match launch::editor_command(&s.resume_dir()) {
+                    Err(e) => app.status = format!("{e}"),
+                    Ok((mut cmd, true)) => {
+                        app.status = match cmd
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .spawn()
+                        {
+                            Ok(_) => {
+                                format!("Opened {} in your editor", home_short(&s.resume_dir()))
+                            }
+                            Err(e) => format!("Could not start the editor: {e}"),
+                        };
+                    }
+                    Ok((cmd, false)) => return Ok(Step::Suspend(cmd)),
+                }
+            }
+        }
+        Action::Export => {
+            if let Some(s) = app.target().cloned() {
+                let dir = crate::config::data_dir().join("exports");
+                std::fs::create_dir_all(&dir)?;
+                let path = dir.join(transcript::file_name(&s));
+                let md = transcript::to_markdown(&s, &transcript::load(&s.path), false);
+                std::fs::write(&path, md)?;
+                launch::copy(&path.to_string_lossy());
+                app.status = format!("Exported to {} (path copied)", path.display());
+            }
+        }
+        Action::Pin => {
+            if let Some((id, on)) = app.target().map(|s| (s.id.clone(), !s.pinned)) {
+                db.set_pinned(&id, on)?;
+                app.reload_keep(db)?;
+                app.status = if on {
+                    "Pinned: it stays on top of the list".into()
+                } else {
+                    "Unpinned".into()
+                };
+            }
+        }
+        Action::Hide => {
+            if let Some((id, on)) = app.target().map(|s| (s.id.clone(), !s.hidden)) {
+                db.set_hidden(&id, on)?;
+                app.reload_keep(db)?;
+                app.status = if on {
+                    "Hidden. Type is:hidden to see hidden sessions.".into()
+                } else {
+                    "Unhidden".into()
+                };
+            }
+        }
+        Action::Note => {
+            if let Some(s) = app.target() {
+                app.note_input = Some((s.id.clone(), s.note.clone().unwrap_or_default()));
+            }
+        }
+        Action::Describe => {
+            if let Some(s) = app.target().cloned() {
+                app.status = match crate::describe::describe_one(db, &s, &cfg.describe_model) {
+                    Ok((t, _)) => {
+                        app.reload_keep(db)?;
+                        format!("Described: {t}")
+                    }
+                    Err(e) => format!("describe failed: {e}"),
+                };
+            }
+        }
+        Action::NewTab => {
+            if let Some(s) = app.target() {
+                app.status = match launch::open_tab(s) {
+                    Ok(m) => m,
+                    Err(e) => format!("{e} — use ctrl-y to copy the command"),
+                };
+            }
+        }
+        Action::CopyCmd => {
+            if let Some(s) = app.target() {
+                let cmd = launch::resume_command(s);
+                launch::copy(&cmd);
+                app.status = format!("Copied: {cmd}");
+            }
+        }
+        Action::CopyId => {
+            if let Some(s) = app.target() {
+                launch::copy(&s.id);
+                app.status = format!("Copied: {}", s.id);
+            }
+        }
+    }
+    Ok(Step::Stay)
+}
+
+fn viewer_key(app: &mut App, k: KeyEvent) -> Step {
+    let Some(v) = app.viewer.as_mut() else {
+        return Step::Stay;
+    };
+    if let Some(input) = v.input.as_mut() {
+        match k.code {
+            KeyCode::Esc => v.input = None,
+            KeyCode::Enter => {
+                v.find = std::mem::take(input);
+                v.input = None;
+                if !v.find_next(true) {
+                    app.status = format!("\"{}\" not found", v.find);
+                }
+            }
+            KeyCode::Backspace => {
+                input.pop();
+            }
+            KeyCode::Char(c) => input.push(c),
+            _ => {}
+        }
+        return Step::Stay;
+    }
+    let page = v.height.saturating_sub(2).max(1);
+    let last = v.rows.len().saturating_sub(1);
+    match k.code {
+        KeyCode::Esc | KeyCode::Char('q') => app.viewer = None,
+        KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+            return Step::Exit(Outcome::Quit);
+        }
+        KeyCode::Enter => {
+            let s = v.session.clone();
+            if !s.missing {
+                return Step::Exit(Outcome::Resume(Box::new(s)));
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => v.scroll = v.scroll.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => v.scroll = (v.scroll + 1).min(last),
+        KeyCode::PageUp | KeyCode::Char('b') => v.scroll = v.scroll.saturating_sub(page),
+        KeyCode::PageDown | KeyCode::Char(' ') | KeyCode::Char('f') => {
+            v.scroll = (v.scroll + page).min(last)
+        }
+        KeyCode::Home | KeyCode::Char('g') => v.scroll = 0,
+        KeyCode::End | KeyCode::Char('G') => v.scroll = last.saturating_sub(page),
+        KeyCode::Char('/') => v.input = Some(String::new()),
+        KeyCode::Char('n') => {
+            if !v.find_next(true) && !v.find.is_empty() {
+                app.status = format!("\"{}\" not found", v.find);
+            }
+        }
+        KeyCode::Char('N') => {
+            v.find_next(false);
+        }
+        KeyCode::Char('o') => {
+            v.outputs = !v.outputs;
+            v.width = 0; // force rebuild
+        }
+        _ => {}
+    }
+    Step::Stay
+}
+
+fn note_key(app: &mut App, k: KeyEvent, db: &mut Db) -> Result<Step> {
+    let Some((id, text)) = app.note_input.as_mut() else {
+        return Ok(Step::Stay);
+    };
+    match k.code {
+        KeyCode::Esc => app.note_input = None,
+        KeyCode::Enter => {
+            let (id, text) = (id.clone(), text.trim().to_string());
+            db.set_note(&id, Some(&text))?;
+            app.note_input = None;
+            app.reload_keep(db)?;
+            app.status = if text.is_empty() {
+                "Note cleared".into()
+            } else {
+                "Note saved (it's searchable too)".into()
+            };
+        }
+        KeyCode::Backspace => {
+            text.pop();
+        }
+        KeyCode::Char(c) => text.push(c),
+        _ => {}
+    }
+    Ok(Step::Stay)
+}
+
+fn on_key(app: &mut App, k: KeyEvent, db: &mut Db, cfg: &Config) -> Result<Step> {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     app.status.clear();
+    if app.viewer.is_some() {
+        return Ok(viewer_key(app, k));
+    }
+    if app.note_input.is_some() {
+        return note_key(app, k, db);
+    }
+    if app.menu {
+        app.menu = false;
+        if let KeyCode::Char(c) = k.code {
+            if let Some((_, a, _)) = MENU.iter().find(|(key, _, _)| *key == c) {
+                return do_action(app, *a, db, cfg);
+            }
+        }
+        return Ok(Step::Stay);
+    }
+    let action = match (k.code, ctrl) {
+        (KeyCode::Char('a'), true) => {
+            app.menu = true;
+            return Ok(Step::Stay);
+        }
+        (KeyCode::Char('b'), true) => Some(Action::OpenPr),
+        (KeyCode::Char('k'), true) => Some(Action::OpenTicket),
+        (KeyCode::Char('v'), true) => Some(Action::View),
+        (KeyCode::Char('e'), true) => Some(Action::Editor),
+        (KeyCode::Char('s'), true) => Some(Action::Pin),
+        (KeyCode::Char('d'), true) => Some(Action::Describe),
+        (KeyCode::Char('o'), true) => Some(Action::NewTab),
+        (KeyCode::Char('y'), true) => Some(Action::CopyCmd),
+        _ => None,
+    };
+    if let Some(a) = action {
+        return do_action(app, a, db, cfg);
+    }
     match (k.code, ctrl) {
-        (KeyCode::Char('c'), true) => return Ok(Some(Outcome::Quit)),
+        (KeyCode::Char('c'), true) => return Ok(Step::Exit(Outcome::Quit)),
         (KeyCode::Esc, _) => {
             if app.query.is_empty() {
-                return Ok(Some(Outcome::Quit));
+                return Ok(Step::Exit(Outcome::Quit));
             }
             app.query.clear();
             app.refilter(db);
@@ -281,7 +823,7 @@ fn on_key(app: &mut App, k: KeyEvent, db: &mut Db, cfg: &Config) -> Result<Optio
                     if s.missing {
                         app.status = "This transcript was deleted by Claude Code's retention; it can't be resumed.".into();
                     } else {
-                        return Ok(Some(Outcome::Resume(Box::new(s.clone()))));
+                        return Ok(Step::Exit(Outcome::Resume(Box::new(s.clone()))));
                     }
                 }
             }
@@ -350,22 +892,14 @@ fn on_key(app: &mut App, k: KeyEvent, db: &mut Db, cfg: &Config) -> Result<Optio
             };
             app.refilter(db);
         }
-        (KeyCode::Up, _) | (KeyCode::Char('p'), true) | (KeyCode::Char('k'), true) => {
-            app.move_by(-1)
-        }
-        (KeyCode::Down, _) | (KeyCode::Char('n'), true) | (KeyCode::Char('j'), true) => {
-            app.move_by(1)
-        }
+        (KeyCode::Up, _) | (KeyCode::Char('p'), true) => app.move_by(-1),
+        (KeyCode::Down, _) | (KeyCode::Char('n'), true) => app.move_by(1),
         (KeyCode::PageUp, _) => app.move_by(-10),
         (KeyCode::PageDown, _) => app.move_by(10),
         (KeyCode::Home, _) => app.move_by(-100_000),
         (KeyCode::End, _) => app.move_by(100_000),
-        (KeyCode::Right, _) | (KeyCode::Char('l'), true) => {
-            app.preview_scroll = app.preview_scroll.saturating_add(3)
-        }
-        (KeyCode::Left, _) | (KeyCode::Char('h'), true) => {
-            app.preview_scroll = app.preview_scroll.saturating_sub(3)
-        }
+        (KeyCode::Right, _) => app.preview_scroll = app.preview_scroll.saturating_add(3),
+        (KeyCode::Left, _) => app.preview_scroll = app.preview_scroll.saturating_sub(3),
         (KeyCode::Char('u'), true) => {
             app.query.clear();
             app.refilter(db);
@@ -385,55 +919,6 @@ fn on_key(app: &mut App, k: KeyEvent, db: &mut Db, cfg: &Config) -> Result<Optio
             };
             app.refilter(db);
         }
-        (KeyCode::Char('y'), true) => {
-            if let Some(s) = app.selected() {
-                let cmd = launch::resume_command(s);
-                launch::copy(&cmd);
-                app.status = format!("Copied: {cmd}");
-            }
-        }
-        (KeyCode::Char('o'), true) => {
-            if let Some(s) = app.selected() {
-                app.status = match launch::open_tab(s) {
-                    Ok(m) => m,
-                    Err(e) => format!("{e} — use ctrl-y to copy the command"),
-                };
-            }
-        }
-        (KeyCode::Char('b'), true) => {
-            let url = match app.tab {
-                Tab::Prs => app.selected_pr().and_then(pr_url),
-                Tab::Tasks => app
-                    .selected_task()
-                    .and_then(|t| t.prs.first())
-                    .and_then(|&pi| pr_url(&app.prs[pi])),
-                Tab::Sessions => app.selected().and_then(|s| {
-                    s.cloud_id
-                        .as_ref()
-                        .map(|c| format!("https://claude.ai/code/{c}"))
-                }),
-            };
-            app.status = match url {
-                Some(u) => match launch::open_url(&u) {
-                    Ok(()) => format!("Opened {u}"),
-                    Err(e) => format!("{e}"),
-                },
-                None => "Nothing to open in the browser".into(),
-            };
-        }
-        (KeyCode::Char('d'), true) => {
-            if let Some(s) = app.selected().cloned() {
-                app.status = match crate::describe::describe_one(db, &s, &cfg.describe_model) {
-                    Ok((t, _)) => {
-                        let sel = app.list.selected();
-                        app.reload(db)?;
-                        app.list.select(sel);
-                        format!("Described: {t}")
-                    }
-                    Err(e) => format!("describe failed: {e}"),
-                };
-            }
-        }
         (KeyCode::Char('r'), true) => {
             let rep = crate::index::run(db, cfg, false)?;
             app.reload(db)?;
@@ -452,7 +937,7 @@ fn on_key(app: &mut App, k: KeyEvent, db: &mut Db, cfg: &Config) -> Result<Optio
         }
         _ => {}
     }
-    Ok(None)
+    Ok(Step::Stay)
 }
 
 fn pr_url(p: &PrEntry) -> Option<String> {
@@ -526,6 +1011,10 @@ fn draw(f: &mut Frame, app: &mut App) {
         [a, b]
     };
 
+    if app.viewer.is_some() {
+        draw_viewer(f, app, main, bottom);
+        return;
+    }
     match app.tab {
         Tab::Sessions => {
             draw_session_list(f, app, left);
@@ -541,7 +1030,20 @@ fn draw(f: &mut Frame, app: &mut App) {
         }
     }
 
-    let help = if !app.status.is_empty() {
+    if app.menu {
+        draw_menu(f, app, main);
+    }
+    let help = if let Some((_, text)) = &app.note_input {
+        Line::from(vec![
+            Span::styled(
+                "Note: ",
+                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(text.clone()),
+            Span::styled("█", Style::new().fg(Color::Yellow)),
+            Span::styled("   enter save · esc cancel · empty clears", DIM),
+        ])
+    } else if !app.status.is_empty() {
         Line::from(Span::styled(
             app.status.clone(),
             Style::new().fg(Color::Yellow),
@@ -555,22 +1057,136 @@ fn draw(f: &mut Frame, app: &mut App) {
         };
         let mut v = Vec::new();
         match app.tab {
-            Tab::Sessions => {
-                v.extend(k("enter", "resume"));
-                v.extend(k("^o", "new tab"));
-                v.extend(k("^y", "copy"));
-                v.extend(k("^d", "describe"));
-            }
-            Tab::Tasks | Tab::Prs => v.extend(k("enter", "show its sessions")),
+            Tab::Sessions => v.extend(k("enter", "resume")),
+            Tab::Tasks | Tab::Prs => v.extend(k("enter", "sessions")),
         }
+        v.extend(k("^a", "actions"));
+        v.extend(k("^v", "read"));
+        v.extend(k("^b", "PR"));
+        v.extend(k("^k", "ticket"));
+        v.extend(k("^s", "pin"));
         v.extend(k("tab", "view"));
         v.extend(k("^g", "here/all"));
-        v.extend(k("^t", "hide quick"));
-        v.extend(k("^b", "web"));
+        v.extend(k("^t", "quick"));
         v.extend(k("^f", "full-text"));
-        v.extend(k("←→", "scroll"));
         v.extend(k("esc", "quit"));
         Line::from(v)
+    };
+    f.render_widget(Paragraph::new(help), bottom);
+}
+
+fn draw_menu(f: &mut Frame, app: &App, area: Rect) {
+    let target = app
+        .target()
+        .map(|s| truncate(&s.title(), 44))
+        .unwrap_or_else(|| "nothing selected".into());
+    let mut lines = vec![Line::from(Span::styled(target, BOLD)), Line::raw("")];
+    for (key, _, what) in MENU {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {key} "),
+                Style::new()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!("  {what}")),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled("any other key closes", DIM)));
+    let h = (lines.len() as u16 + 2).min(area.height);
+    let w = 52.min(area.width);
+    let r = Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + (area.height - h) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, r);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(" Actions ")
+                .border_style(Style::new().fg(Color::Cyan)),
+        ),
+        r,
+    );
+}
+
+fn draw_viewer(f: &mut Frame, app: &mut App, main: Rect, bottom: Rect) {
+    let Some(v) = app.viewer.as_mut() else { return };
+    let inner_w = main.width.saturating_sub(2);
+    if v.width != inner_w {
+        v.rebuild(inner_w);
+    }
+    v.height = main.height.saturating_sub(2) as usize;
+    let q = v.find.to_lowercase();
+    let lines: Vec<Line> = v
+        .rows
+        .iter()
+        .skip(v.scroll)
+        .take(v.height)
+        .map(|(st, t)| {
+            if !q.is_empty() && t.to_lowercase().contains(&q) {
+                Line::from(Span::styled(t.clone(), st.bg(Color::Indexed(58))))
+            } else {
+                Line::from(Span::styled(t.clone(), *st))
+            }
+        })
+        .collect();
+    let pct = if v.rows.len() <= v.height {
+        100
+    } else {
+        (v.scroll + v.height).min(v.rows.len()) * 100 / v.rows.len()
+    };
+    let title = format!(
+        " {} · {} · {pct}% ",
+        truncate(&v.session.title(), 60),
+        v.session.short_id()
+    );
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(title)
+                .border_style(Style::new().fg(Color::Cyan)),
+        ),
+        main,
+    );
+    let help = if let Some(input) = &v.input {
+        Line::from(vec![
+            Span::styled("/", Style::new().fg(Color::Yellow)),
+            Span::raw(input.clone()),
+            Span::styled("█", Style::new().fg(Color::Yellow)),
+        ])
+    } else if !app.status.is_empty() {
+        Line::from(Span::styled(
+            app.status.clone(),
+            Style::new().fg(Color::Yellow),
+        ))
+    } else {
+        let k = |key: &'static str, what: &'static str| {
+            vec![
+                Span::styled(key, Style::new().fg(Color::Cyan)),
+                Span::styled(format!(" {what}  "), DIM),
+            ]
+        };
+        let mut x = Vec::new();
+        x.extend(k("enter", "resume this session"));
+        x.extend(k("↑↓ space b", "scroll"));
+        x.extend(k("g G", "top/end"));
+        x.extend(k("/", "find"));
+        x.extend(k("n N", "next/prev"));
+        x.extend(k(
+            "o",
+            if v.outputs {
+                "hide tool output"
+            } else {
+                "show tool output"
+            },
+        ));
+        x.extend(k("esc", "back"));
+        Line::from(x)
     };
     f.render_widget(Paragraph::new(help), bottom);
 }
@@ -611,6 +1227,9 @@ fn draw_session_list(f: &mut Frame, app: &mut App, area: Rect) {
             let a = format!("{:>4} ", age(s.ended.as_deref().or(s.started.as_deref())));
             let mut l1 = vec![Span::styled(a, DIM)];
             let title_style = if s.missing { DIM } else { BOLD };
+            if s.pinned {
+                l1.push(Span::styled("★ ", Style::new().fg(Color::Yellow)));
+            }
             l1.push(Span::styled(
                 truncate(&s.title(), width.saturating_sub(6)),
                 title_style,
@@ -643,6 +1262,15 @@ fn draw_session_list(f: &mut Frame, app: &mut App, area: Rect) {
                 ));
             }
             l2.extend(pr_badges(s, 4));
+            if let Some(t) = s.tickets.first() {
+                l2.push(Span::styled(format!(" ⚑{t}"), Style::new().fg(Color::Cyan)));
+            }
+            if s.note.is_some() {
+                l2.push(Span::styled(" ✎", Style::new().fg(Color::Yellow)));
+            }
+            if s.hidden {
+                l2.push(Span::styled(" (hidden)", DIM));
+            }
             if let Some(n) = task {
                 l2.push(Span::styled(
                     format!("  ⋯ task of {n}"),
@@ -731,6 +1359,20 @@ fn draw_session_preview(f: &mut Frame, app: &App, area: Rect) {
         ]));
     }
     lines.push(Line::from(Span::styled(format!("id {}", s.id), DIM)));
+    if let Some(n) = &s.note {
+        lines.push(Line::from(vec![
+            Span::styled("✎ ", Style::new().fg(Color::Yellow)),
+            Span::styled(n.clone(), Style::new().fg(Color::Yellow)),
+        ]));
+    }
+    for t in &s.tickets {
+        let url = crate::config::ticket_url(t)
+            .unwrap_or_else(|| "(^k needs a tickets URL in the config)".into());
+        lines.push(Line::from(vec![
+            Span::styled(format!("⚑ {t}  "), Style::new().fg(Color::Cyan)),
+            Span::styled(url, DIM),
+        ]));
+    }
     if let Some(c) = &s.cloud_id {
         lines.push(Line::from(Span::styled(
             format!("☁ https://claude.ai/code/{c}"),
@@ -1046,6 +1688,12 @@ fn draw_task_list(f: &mut Frame, app: &mut App, area: Rect) {
                 format!(" · {} sessions", t.sessions.len()),
                 Style::new().fg(Color::Yellow),
             ));
+            if t.cost_usd > 0.0 {
+                l2.push(Span::styled(format!(" · ${:.2}", t.cost_usd), DIM));
+            }
+            if let Some(k) = t.tickets.first() {
+                l2.push(Span::styled(format!(" ⚑{k}"), Style::new().fg(Color::Cyan)));
+            }
             for &pi in t.prs.iter().take(3) {
                 let p = &app.prs[pi];
                 let role = p
@@ -1093,8 +1741,23 @@ fn draw_task_preview(f: &mut Frame, app: &App, area: Rect) {
                     .unwrap_or_default(),
                 DIM,
             ),
+            Span::styled(
+                if t.cost_usd > 0.0 {
+                    format!("  · ${:.2} total", t.cost_usd)
+                } else {
+                    String::new()
+                },
+                DIM,
+            ),
         ]),
     ];
+    for k in &t.tickets {
+        let url = crate::config::ticket_url(k).unwrap_or_default();
+        lines.push(Line::from(vec![
+            Span::styled(format!("⚑ {k}  "), Style::new().fg(Color::Cyan)),
+            Span::styled(url, DIM),
+        ]));
+    }
     for &pi in &t.prs {
         let p = &app.prs[pi];
         lines.push(Line::from(vec![

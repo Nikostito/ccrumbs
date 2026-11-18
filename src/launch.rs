@@ -59,11 +59,11 @@ fn which(bin: &str) -> bool {
 pub fn copy(text: &str) -> bool {
     use base64_lite::encode;
     let _ = write!(
-        std::io::stdout(),
+        std::io::stderr(),
         "\x1b]52;c;{}\x07",
         encode(text.as_bytes())
     );
-    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
     let tools: &[&[&str]] = if cfg!(target_os = "macos") {
         &[&["pbcopy"]]
     } else if cfg!(windows) {
@@ -198,6 +198,60 @@ pub fn open_tab(s: &SessionRow) -> Result<String> {
     bail!(
         "no supported terminal found (tmux, zellij, wezterm, kitty, gnome-terminal, konsole, xfce4-terminal, xterm)"
     )
+}
+
+/// How to open a project directory in an editor. The bool is true for GUI editors,
+/// which are started detached; terminal editors need the screen.
+pub fn editor_command(dir: &str) -> Result<(Command, bool)> {
+    const GUI: &[&str] = &[
+        "code",
+        "cursor",
+        "codium",
+        "windsurf",
+        "zed",
+        "subl",
+        "idea",
+        "webstorm",
+        "pycharm",
+        "goland",
+        "rustrover",
+        "fleet",
+        "open",
+        "xdg-open",
+        "mate",
+        "atom",
+    ];
+    let pick = ["CCTRAIL_EDITOR", "VISUAL", "EDITOR"]
+        .iter()
+        .find_map(|v| std::env::var(v).ok().filter(|s| !s.trim().is_empty()))
+        .or_else(|| {
+            ["code", "cursor", "zed"]
+                .iter()
+                .find(|b| which(b))
+                .map(|b| b.to_string())
+        })
+        .ok_or_else(|| anyhow::anyhow!("set $EDITOR (or $CCTRAIL_EDITOR) to open projects"))?;
+    if !Path::new(dir).is_dir() {
+        bail!("directory {dir} no longer exists");
+    }
+    let bin = pick.split_whitespace().next().unwrap_or("vi").to_string();
+    let name = Path::new(&bin)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or(bin);
+    // Let the shell parse $EDITOR, so values like `code -w` or quoted commands work.
+    let mut cmd = if cfg!(unix) {
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(format!("{pick} \"$1\"")).arg("sh").arg(dir);
+        c
+    } else {
+        let mut parts = pick.split_whitespace();
+        let mut c = Command::new(parts.next().unwrap_or("notepad"));
+        c.args(parts).arg(dir);
+        c
+    };
+    cmd.current_dir(dir);
+    Ok((cmd, GUI.contains(&name.as_str())))
 }
 
 pub fn open_url(url: &str) -> Result<()> {

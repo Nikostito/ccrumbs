@@ -60,6 +60,26 @@ pub fn parse_session(
         }
     }
     st.s.cost_usd = st.cost_runs.values().sum();
+    let mut cands: Vec<crate::tickets::Candidate> = Vec::new();
+    if let Some(b) = &st.s.branch {
+        for key in crate::tickets::from_branch(b) {
+            cands.push(crate::tickets::Candidate { key, strong: true });
+        }
+    }
+    let texts =
+        st.s.prompts
+            .iter()
+            .chain(st.s.last_prompt.iter())
+            .chain(st.s.custom_title.iter())
+            .chain(st.s.summary.iter());
+    for t in texts {
+        for key in crate::tickets::from_text(t) {
+            if !cands.iter().any(|c| c.key == key) {
+                cands.push(crate::tickets::Candidate { key, strong: false });
+            }
+        }
+    }
+    st.s.tickets = cands;
     st.s.cloud_id = st
         .cloud
         .iter()

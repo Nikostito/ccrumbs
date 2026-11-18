@@ -18,6 +18,8 @@ pub struct Task {
     /// Indices into the PR entries slice.
     pub prs: Vec<usize>,
     pub title: String,
+    pub tickets: Vec<String>,
+    pub cost_usd: f64,
 }
 
 pub fn is_default_branch(b: &str) -> bool {
@@ -64,6 +66,11 @@ pub fn build(sessions: &[SessionRow], prs: &[PrEntry]) -> (Vec<Task>, Vec<Option
                 .unwrap_or_else(|| s.resume_dir())
                 .to_lowercase();
             join(&mut dsu, format!("branch|{place}|{b}"), i);
+        }
+    }
+    for (i, s) in sessions.iter().enumerate() {
+        for t in &s.tickets {
+            join(&mut dsu, format!("ticket|{t}"), i);
         }
     }
     let mut pr_sessions: Vec<Vec<usize>> = vec![vec![]; prs.len()];
@@ -128,7 +135,23 @@ pub fn build(sessions: &[SessionRow], prs: &[PrEntry]) -> (Vec<Task>, Vec<Option
             .next()
             .or_else(|| branch.clone())
             .unwrap_or_else(|| sessions[oldest].title());
+        let mut tickets: Vec<String> = Vec::new();
+        for &i in &g {
+            for t in &sessions[i].tickets {
+                if !tickets.contains(t) {
+                    tickets.push(t.clone());
+                }
+            }
+        }
+        let cost_usd = g.iter().map(|&i| sessions[i].cost_usd).sum();
+        let no_pr_title = task_prs.iter().all(|&pi| prs[pi].title().is_none());
+        let title = match (no_pr_title, tickets.first()) {
+            (true, Some(key)) => ticket_title(key, branch.as_deref()),
+            _ => title,
+        };
         tasks.push(Task {
+            tickets,
+            cost_usd,
             id,
             project: sessions[oldest].project_name(),
             sessions: g,
@@ -138,4 +161,18 @@ pub fn build(sessions: &[SessionRow], prs: &[PrEntry]) -> (Vec<Task>, Vec<Option
         });
     }
     (tasks, task_of)
+}
+
+/// `WEB-142: dark mode` from the key and a branch like `feature/WEB-142-dark-mode`.
+fn ticket_title(key: &str, branch: Option<&str>) -> String {
+    let rest = branch.and_then(|b| {
+        let lb = b.to_lowercase();
+        let at = lb.find(&key.to_lowercase())?;
+        let tail = b[at + key.len()..].trim_matches(|c: char| c == '-' || c == '_' || c == '/');
+        (!tail.is_empty()).then(|| tail.replace(['-', '_', '/'], " "))
+    });
+    match rest {
+        Some(r) => format!("{key}: {r}"),
+        None => key.to_string(),
+    }
 }

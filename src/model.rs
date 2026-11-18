@@ -118,6 +118,7 @@ pub struct ParsedSession {
     pub compactions: u32,
     /// Claude Code's own cost tally for the session, summed over runs (resumes).
     pub cost_usd: f64,
+    pub tickets: Vec<crate::tickets::Candidate>,
     pub model: Option<String>,
     pub entrypoint: Option<String>,
     /// `session_...` id of the claude.ai cloud session, if the transcript reveals one.
@@ -155,6 +156,11 @@ pub struct SessionRow {
     pub context_tokens: u64,
     pub compactions: u32,
     pub cost_usd: f64,
+    /// Issue-tracker keys (Jira/Linear) linked to the session.
+    pub tickets: Vec<String>,
+    pub pinned: bool,
+    pub hidden: bool,
+    pub note: Option<String>,
     pub model: Option<String>,
     pub entrypoint: Option<String>,
     pub cloud_id: Option<String>,
@@ -251,6 +257,17 @@ impl SessionRow {
             out.push_str(&format!(" · compacted {}×", self.compactions));
         }
         Some(out)
+    }
+
+    /// Pair a freshly loaded row with its stored ticket candidates (resolved later).
+    pub fn with_ticket_candidates(
+        self,
+        json: Option<String>,
+    ) -> (SessionRow, Vec<crate::tickets::Candidate>) {
+        let c = json
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default();
+        (self, c)
     }
 
     pub fn short_id(&self) -> &str {

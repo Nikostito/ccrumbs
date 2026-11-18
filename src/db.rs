@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 /// Bump when the derived tables change shape; they are rebuilt from transcripts.
 /// `ai` and `prs` hold data that can't be re-derived locally and are kept.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 pub struct Db {
     pub conn: Connection,
@@ -44,7 +44,12 @@ impl Db {
                 files_json TEXT, commands_run INT, tests_ran INT, commits INT,
                 tokens_in INT, tokens_out INT, model TEXT, entrypoint TEXT, cloud_id TEXT,
                 last_reply TEXT, auto_desc TEXT, mtime INT, size INT, missing INT DEFAULT 0,
-                context_tokens INT DEFAULT 0, compactions INT DEFAULT 0, cost_usd REAL DEFAULT 0
+                context_tokens INT DEFAULT 0, compactions INT DEFAULT 0, cost_usd REAL DEFAULT 0,
+                tickets_json TEXT
+            );
+            -- Your own marks on sessions. Not derived from transcripts, so never dropped.
+            CREATE TABLE IF NOT EXISTS marks (
+                id TEXT PRIMARY KEY, pinned INT DEFAULT 0, hidden INT DEFAULT 0, note TEXT
             );
             CREATE INDEX IF NOT EXISTS sessions_started ON sessions(started);
             CREATE INDEX IF NOT EXISTS sessions_cloud ON sessions(cloud_id);
@@ -89,8 +94,8 @@ impl Db {
                 "INSERT INTO sessions (id, path, project_dir, cwd, branch, repo, started, ended, user_prompts,
                  assistant_msgs, custom_title, summary, first_prompt, last_prompt, prompts_json, files_json,
                  commands_run, tests_ran, commits, tokens_in, tokens_out, model, entrypoint, cloud_id,
-                 last_reply, auto_desc, mtime, size, missing, context_tokens, compactions, cost_usd)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,0,?29,?30,?31)",
+                 last_reply, auto_desc, mtime, size, missing, context_tokens, compactions, cost_usd, tickets_json)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,0,?29,?30,?31,?32)",
             )?;
             let mut ins_p = tx.prepare(
                 "INSERT OR IGNORE INTO session_prs (session_id, repo, number, role, ts, evidence) VALUES (?1,?2,?3,?4,?5,?6)",
@@ -138,7 +143,8 @@ impl Db {
                     s.size,
                     s.context_tokens as i64,
                     s.compactions,
-                    s.cost_usd
+                    s.cost_usd,
+                    serde_json::to_string(&s.tickets)?
                 ])?;
                 for l in &s.pr_links {
                     ins_p.execute(params![
@@ -217,8 +223,9 @@ impl Db {
             "SELECT s.id, s.path, s.project_dir, s.cwd, s.branch, s.repo, s.started, s.ended, s.user_prompts,
                     s.custom_title, s.summary, s.first_prompt, s.last_prompt, s.files_json, s.tests_ran, s.commits,
                     s.tokens_in, s.tokens_out, s.model, s.entrypoint, s.cloud_id, s.auto_desc, a.title, a.description, s.missing,
-                    s.context_tokens, s.compactions, s.cost_usd
-             FROM sessions s LEFT JOIN ai a ON a.id = s.id
+                    s.context_tokens, s.compactions, s.cost_usd, s.tickets_json,
+                    m.pinned, m.hidden, m.note
+             FROM sessions s LEFT JOIN ai a ON a.id = s.id LEFT JOIN marks m ON m.id = s.id
              ORDER BY COALESCE(s.ended, s.started) DESC",
         )?;
         let rows = st.query_map([], |r| {
@@ -255,13 +262,55 @@ impl Db {
                 context_tokens: r.get::<_, Option<i64>>(25)?.unwrap_or(0) as u64,
                 compactions: r.get::<_, Option<u32>>(26)?.unwrap_or(0),
                 cost_usd: r.get::<_, Option<f64>>(27)?.unwrap_or(0.0),
-            })
+                tickets: vec![],
+                pinned: r.get::<_, Option<bool>>(29)?.unwrap_or(false),
+                hidden: r.get::<_, Option<bool>>(30)?.unwrap_or(false),
+                note: r.get(31)?,
+            }
+            .with_ticket_candidates(r.get::<_, Option<String>>(28)?))
         })?;
-        let mut out: Vec<SessionRow> = rows.collect::<Result<_, _>>()?;
-        for s in &mut out {
-            s.prs = links.remove(&s.id).unwrap_or_default();
+        let mut out: Vec<(SessionRow, Vec<crate::tickets::Candidate>)> =
+            rows.collect::<Result<_, _>>()?;
+        // Prefixes trusted for keys that only appear in prompts: configured ones, and
+        // any prefix seen in some session's branch name.
+        let templates = crate::config::ticket_templates();
+        let any_prefix = templates.contains_key("*");
+        let mut trusted: std::collections::HashSet<String> =
+            templates.keys().filter(|k| *k != "*").cloned().collect();
+        for (_, c) in &out {
+            trusted.extend(
+                c.iter()
+                    .filter(|c| c.strong)
+                    .map(|c| crate::tickets::prefix(&c.key).to_string()),
+            );
         }
-        Ok(out)
+        for (s, c) in &mut out {
+            s.prs = links.remove(&s.id).unwrap_or_default();
+            s.tickets = crate::tickets::resolve(c, &trusted, any_prefix);
+        }
+        Ok(out.into_iter().map(|(s, _)| s).collect())
+    }
+
+    fn mark(&self, id: &str, col: &str, val: &dyn rusqlite::ToSql) -> Result<()> {
+        self.conn
+            .execute("INSERT OR IGNORE INTO marks (id) VALUES (?1)", [id])?;
+        self.conn.execute(
+            &format!("UPDATE marks SET {col} = ?2 WHERE id = ?1"),
+            params![id, val],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_pinned(&self, id: &str, on: bool) -> Result<()> {
+        self.mark(id, "pinned", &on)
+    }
+
+    pub fn set_hidden(&self, id: &str, on: bool) -> Result<()> {
+        self.mark(id, "hidden", &on)
+    }
+
+    pub fn set_note(&self, id: &str, note: Option<&str>) -> Result<()> {
+        self.mark(id, "note", &note.filter(|n| !n.trim().is_empty()))
     }
 
     /// Full-text search over prompts, replies and commands. Returns ids, best first.

@@ -56,6 +56,28 @@ sessions first (◉ same branch, ○ same repo). Inside a repo, plain
 
   ![Filtering by an edited file](docs/filters.png)
 
+- **Read before you resume.** `Ctrl-V` opens the whole conversation
+  (prompts, replies, tool calls; `o` shows tool output) with `/` search, so
+  you can check it's the right session. Enter resumes it from there.
+
+  ![Reading a session](docs/viewer.png)
+
+- **Jira and Linear tickets.** Keys like `ABC-123` are picked up from branch
+  names (`feature/ABC-123-…`, `nikos/eng-42-…`), prompts and titles. They
+  show as ⚑ badges, are searchable (type `ABC-123`), group sessions into
+  one task, and `Ctrl-K` opens the ticket.
+- **Pins, notes and cleanup.** `Ctrl-S` pins the sessions you're juggling to
+  the top. Notes (`Ctrl-A n`) show in the preview and are searchable.
+  Sessions you'll never need again can be hidden (`Ctrl-A h`).
+- **One menu for everything else.** `Ctrl-A` lists every action for the
+  selection: open its PR, ticket or claude.ai page, open the project in your
+  editor, export as Markdown, describe with Claude, copy the id, and so on.
+
+  ![The actions menu](docs/actions.png)
+
+- **Claude can search your history too.** `cctrail mcp` is an MCP server,
+  so inside a session you can ask *"how did we fix the redis bucket issue
+  last time?"* (see [Use from Claude Code](#use-from-claude-code-mcp)).
 - **Fast.** It's written in Rust: transcripts are parsed in parallel, and only
   changed files are re-parsed. On a synthetic 641 MB history of 2,000
   sessions, the first index takes about 4 s; after that the automatic
@@ -86,6 +108,14 @@ Or, from a clone, run `cargo install --path . --locked`. That puts a single
 | `cctrail search <words>` | Full-text search across every prompt, reply and shell command |
 | `cctrail show <id>` | Everything about one session |
 | `cctrail resume <id> [--tab \| --print]` | Resume here, in a new terminal tab, or just print the command |
+| `cctrail view <id> [--outputs]` | Print the conversation (pipe to `less -R`) |
+| `cctrail export <id> [-o file.md \| -o -]` | Summary, PRs, tickets, files and conversation as Markdown |
+| `cctrail open <id \| #PR \| ABC-123> [--pr\|--ticket\|--cloud] [--print]` | Open the session's PR, ticket or claude.ai page |
+| `cctrail pin <id>` / `unpin` · `note <id> [text]` · `hide <id>` / `unhide` | Your own marks; `note <id>` with no text clears it |
+| `cctrail dir <id>` | Print the session's directory: `cd "$(cctrail dir a1b2)"` |
+| `cctrail pick --print-dir` / `--print` | Pick interactively, print the directory / resume command |
+| `cctrail shell-init zsh\|bash\|fish` | Key binding and `ccd` helper (see below) |
+| `cctrail mcp` | MCP server for Claude Code (see below) |
 
 Session ids can be abbreviated to their first few characters, like git
 hashes.
@@ -110,15 +140,22 @@ Plain words match titles, projects, branches, descriptions and prompts:
 | `p:` `b:` `f:` `repo:` `has:pr` | project, branch, edited file, repo, did PR work |
 | `@today` `@yesterday` `@week` `@month` `@3d` `@2w` | last active in that window |
 | `ctx:>80`, `ctx:<30` | how full the context window was at the end |
+| `ABC-123`, `t:abc-123` | sessions linked to that ticket |
+| `is:pinned` `has:note` `is:hidden` | your marks (hidden sessions only show with `is:hidden`) |
 | **Enter** | resume the session (in Tasks / PRs: list that task's or PR's sessions) |
 | **Tab** / **Shift-Tab** | cycle Sessions → Tasks → PRs |
 | `Ctrl-G` | toggle "here first" ranking (repo and branch you started in) |
 | `Ctrl-T` | hide / show one-off quick sessions (1 prompt, no edits, no PRs) |
+| `Ctrl-A` | actions menu for the selection (everything below, plus export, note, hide, copy id) |
+| `Ctrl-V` | read the conversation (`/` find, `n`/`N` next/prev, `o` tool output, Enter resume, Esc back) |
+| `Ctrl-K` | open the Jira / Linear ticket |
+| `Ctrl-S` | pin / unpin |
+| `Ctrl-E` | open the project in your editor (`$CCTRAIL_EDITOR`, `$VISUAL`, `$EDITOR`, else VS Code / Cursor / Zed) |
 | `Ctrl-O` | resume in a new terminal tab (tmux, zellij, wezterm, kitty, iTerm2, Terminal.app, GNOME Terminal, Konsole, Windows Terminal, …) |
 | `Ctrl-Y` | copy `cd … && claude --resume …` |
 | `Ctrl-F` | toggle full-text search |
 | `Ctrl-D` | have Claude describe the selected session |
-| `Ctrl-B` | open the PR, or the claude.ai cloud session, in your browser |
+| `Ctrl-B` | open the session's PR in your browser (else its claude.ai page) |
 | `Ctrl-R` | re-index |
 | `←` / `→` | scroll the preview |
 | `Esc` | clear the query, or quit |
@@ -156,9 +193,39 @@ session, or carries the "Generated with Claude Code" footer, as **born from
 Claude**, even when there's no transcript on this machine. It also links
 sessions that worked on a PR's head branch.
 
+## Shell integration
+
+```bash
+eval "$(cctrail shell-init zsh)"     # or bash; fish: cctrail shell-init fish | source
+```
+
+This gives you **Alt-S** to open the picker from any prompt, and
+**`ccd [query]`** to pick a session and `cd` into its directory without
+resuming it. `ccd` uses `cctrail pick --print-dir`; the picker draws on
+stderr, so command substitution works.
+
+## Use from Claude Code (MCP)
+
+```bash
+claude mcp add cctrail -- cctrail mcp
+```
+
+Claude then gets four tools that work on your local index:
+
+| Tool | What it returns |
+|---|---|
+| `search_sessions` | Sessions matching a query (same syntax as the picker, or full-text) |
+| `get_session` | Description, prompts, files, PRs (and who else created or reviewed them), notes, last reply, resume command |
+| `read_transcript` | The conversation; with `query`, just the passages that mention it |
+| `find_pr` | Which sessions created, reviewed or worked on a PR |
+
+Ask things like *"find the session where we added rate limiting and tell me
+how the bucket was shared"* or *"who reviewed PR 88?"*. It only reads
+transcripts on your machine and re-indexes incrementally before each call.
+
 ## How tasks are formed
 
-Two sessions land in the same task when they:
+Two sessions land in the same task when they share a ticket key, or when they:
 
 - worked on the same non-default branch (anything but `main`, `master`,
   `develop`, `dev` or `trunk`) of the same repo, or
@@ -192,7 +259,11 @@ and other PR URLs in the same session.
   "claude_projects_dir": null,
   "ignored_projects": [],
   "describe_model": "claude-opus-5-5",
-  "context_windows": {}
+  "context_windows": {},
+  "tickets": {
+    "ABC": "https://acme.atlassian.net/browse/{key}",
+    "ENG": "https://linear.app/acme/issue/{key}"
+  }
 }
 ```
 
@@ -202,12 +273,17 @@ and other PR URLs in the same session.
   matched as a substring of the model id, e.g. `{"sonnet-4-5": 1000000}`.
   Built in: 1M for the Claude 5 family, Opus 4.6–4.8, Sonnet 4.6 and `[1m]`
   models; 200k for the rest.
+- `tickets` maps a ticket prefix to its URL (`{key}` is replaced; `"*"`
+  matches any prefix). Keys in branch names are always picked up. A key that
+  appears only in a prompt counts when its prefix is listed here, or was seen
+  in some branch name. That keeps things like `UTF-8` and `SHA-256` out.
 - `cctrail ignore <substring>` / `cctrail unignore <substring>` stops (or
   resumes) indexing matching projects.
 - `CCTRAIL_HOME` moves the index and config elsewhere.
 - `--no-index` skips the automatic incremental index for one command.
 
-The index is a SQLite file. If Claude Code's retention deletes a transcript,
+The index is a SQLite file. Pins, notes and hidden flags live in their own
+table and survive re-indexing. If Claude Code's retention deletes a transcript,
 the session stays searchable but is marked *transcript deleted* and can't be
 resumed.
 

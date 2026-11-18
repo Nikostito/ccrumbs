@@ -8,6 +8,7 @@ mod describe;
 mod github;
 mod index;
 mod launch;
+mod mcp;
 mod model;
 mod parse;
 mod prdetect;
@@ -15,6 +16,8 @@ mod prview;
 mod search;
 mod tasks;
 mod text;
+mod tickets;
+mod transcript;
 mod tui;
 
 use anyhow::{Result, bail};
@@ -43,7 +46,76 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Open the picker (default). Optional initial query, e.g. `cctrail pick #42`.
-    Pick { query: Vec<String> },
+    Pick {
+        query: Vec<String>,
+        /// Print the resume command instead of running it.
+        #[arg(long)]
+        print: bool,
+        /// Print the session's directory (for `cd "$(cctrail pick --print-dir)"`).
+        #[arg(long, conflicts_with = "print")]
+        print_dir: bool,
+    },
+    /// Read a session's conversation.
+    View {
+        id: String,
+        /// Include tool output (shell results, file reads...).
+        #[arg(long)]
+        outputs: bool,
+    },
+    /// Export a session (summary, PRs, files, conversation) as Markdown.
+    Export {
+        id: String,
+        /// Output file; `-` for stdout. Default: ./<id>-<title>.md
+        #[arg(short, long)]
+        output: Option<String>,
+        #[arg(long)]
+        outputs: bool,
+    },
+    /// Open a session's PR, ticket or claude.ai page in the browser.
+    /// Target: session id, PR ref (#42, owner/repo#42) or ticket key (ABC-123).
+    Open {
+        target: String,
+        #[arg(long)]
+        pr: bool,
+        #[arg(long)]
+        ticket: bool,
+        #[arg(long)]
+        cloud: bool,
+        /// Print the URL instead of opening it.
+        #[arg(long)]
+        print: bool,
+    },
+    /// Pin a session to the top of the picker.
+    Pin {
+        id: String,
+    },
+    Unpin {
+        id: String,
+    },
+    /// Set a note on a session (no text clears it). Notes are searchable.
+    Note {
+        id: String,
+        text: Vec<String>,
+    },
+    /// Hide a session from lists and search (`is:hidden` shows them).
+    Hide {
+        id: String,
+    },
+    Unhide {
+        id: String,
+    },
+    /// Print a session's directory: `cd "$(cctrail dir a1b2)"`.
+    Dir {
+        id: String,
+    },
+    /// Print shell integration (key binding + `ccd`): eval "$(cctrail shell-init zsh)".
+    ShellInit {
+        #[arg(value_parser = ["zsh", "bash", "fish"])]
+        shell: String,
+    },
+    /// Run an MCP server so Claude Code can search your past sessions:
+    /// `claude mcp add cctrail -- cctrail mcp`.
+    Mcp,
     /// Jump straight into the best match; opens the picker if it's ambiguous.
     /// With no query, continues the latest session from the repo/branch you're in.
     Go {
@@ -78,7 +150,9 @@ enum Cmd {
         limit: usize,
     },
     /// Everything about one session: description, PRs, files, how to resume.
-    Show { id: String },
+    Show {
+        id: String,
+    },
     /// Look up a PR by number/ref and show which sessions created, reviewed or touched it.
     Pr {
         /// 42, #42, owner/repo#42 or a PR URL.
@@ -139,9 +213,13 @@ enum Cmd {
     /// Show configuration and paths.
     Config,
     /// Never index projects whose path contains this.
-    Ignore { pattern: String },
+    Ignore {
+        pattern: String,
+    },
     /// Undo `ignore`.
-    Unignore { pattern: String },
+    Unignore {
+        pattern: String,
+    },
 }
 
 struct Paint(bool);
@@ -192,6 +270,13 @@ fn real_main() -> Result<()> {
     if let Some(Cmd::Config | Cmd::Ignore { .. } | Cmd::Unignore { .. }) = &cli.cmd {
         return config_cmd(cli.cmd.unwrap(), &mut cfg);
     }
+    if let Some(Cmd::ShellInit { shell }) = &cli.cmd {
+        print!("{}", shell_init(shell));
+        return Ok(());
+    }
+    if let Some(Cmd::Mcp) = &cli.cmd {
+        return mcp::serve(cfg);
+    }
 
     let mut db = Db::open()?;
     if let Some(Cmd::Index { full }) = &cli.cmd {
@@ -209,9 +294,104 @@ fn real_main() -> Result<()> {
     if !cli.no_index {
         index::run(&mut db, &cfg, false)?;
     }
+    if let Some(Cmd::Pin { id } | Cmd::Unpin { id } | Cmd::Hide { id } | Cmd::Unhide { id }) =
+        &cli.cmd
+    {
+        let sessions = db.load_sessions()?;
+        let s = one(&sessions, id)?;
+        let (what, done) = match cli.cmd.as_ref().unwrap() {
+            Cmd::Pin { .. } => (db.set_pinned(&s.id, true), "Pinned"),
+            Cmd::Unpin { .. } => (db.set_pinned(&s.id, false), "Unpinned"),
+            Cmd::Hide { .. } => (db.set_hidden(&s.id, true), "Hid"),
+            _ => (db.set_hidden(&s.id, false), "Unhid"),
+        };
+        what?;
+        println!("{done} {} \"{}\"", s.short_id(), truncate(&s.title(), 60));
+        return Ok(());
+    }
 
-    match cli.cmd.unwrap_or(Cmd::Pick { query: vec![] }) {
-        Cmd::Pick { query } => pick(&mut db, &cfg, &query.join(" ")),
+    match cli.cmd.unwrap_or(Cmd::Pick {
+        query: vec![],
+        print: false,
+        print_dir: false,
+    }) {
+        Cmd::Pick {
+            query,
+            print,
+            print_dir,
+        } => {
+            let mode = if print_dir {
+                PickMode::Dir
+            } else if print {
+                PickMode::Cmd
+            } else {
+                PickMode::Resume
+            };
+            pick_mode(&mut db, &cfg, &query.join(" "), mode)
+        }
+        Cmd::View { id, outputs } => {
+            let sessions = db.load_sessions()?;
+            let s = one(&sessions, &id)?;
+            let entries = transcript::load(&s.path);
+            if entries.is_empty() {
+                bail!("no readable transcript at {}", s.path);
+            }
+            println!("{}", p.bold(s.title()));
+            print!("{}", transcript::to_text(&entries, outputs));
+            Ok(())
+        }
+        Cmd::Export {
+            id,
+            output,
+            outputs,
+        } => {
+            let sessions = db.load_sessions()?;
+            let s = one(&sessions, &id)?;
+            let md = transcript::to_markdown(s, &transcript::load(&s.path), outputs);
+            match output.as_deref() {
+                Some("-") => print!("{md}"),
+                o => {
+                    let path = o
+                        .map(str::to_string)
+                        .unwrap_or_else(|| transcript::file_name(s));
+                    std::fs::write(&path, md)?;
+                    eprintln!("Wrote {path}");
+                }
+            }
+            Ok(())
+        }
+        Cmd::Open {
+            target,
+            pr,
+            ticket,
+            cloud,
+            print,
+        } => open_cmd(&db, &target, pr, ticket, cloud, print),
+        Cmd::Pin { id } | Cmd::Unpin { id } | Cmd::Hide { id } | Cmd::Unhide { id } => {
+            unreachable!("{id}")
+        }
+        Cmd::Note { id, text } => {
+            let sessions = db.load_sessions()?;
+            let s = one(&sessions, &id)?;
+            let text = text.join(" ");
+            db.set_note(&s.id, Some(&text))?;
+            println!(
+                "{} {}",
+                if text.trim().is_empty() {
+                    "Cleared the note on"
+                } else {
+                    "Noted"
+                },
+                s.short_id()
+            );
+            Ok(())
+        }
+        Cmd::Dir { id } => {
+            let sessions = db.load_sessions()?;
+            println!("{}", one(&sessions, &id)?.resume_dir());
+            Ok(())
+        }
+        Cmd::ShellInit { .. } | Cmd::Mcp => unreachable!(),
         Cmd::Go { query, print } => go(&mut db, &cfg, &query.join(" "), print),
         Cmd::List {
             query,
@@ -380,14 +560,141 @@ fn config_cmd(cmd: Cmd, cfg: &mut Config) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum PickMode {
+    Resume,
+    Cmd,
+    Dir,
+}
+
 fn pick(db: &mut Db, cfg: &Config, query: &str) -> Result<()> {
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+    pick_mode(db, cfg, query, PickMode::Resume)
+}
+
+fn pick_mode(db: &mut Db, cfg: &Config, query: &str, mode: PickMode) -> Result<()> {
+    // The picker draws on stderr, so stdout may be captured by `$(...)`.
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
         bail!("the picker needs a terminal; try `cctrail list` or `cctrail go <query> --print`");
     }
-    match tui::run(db, cfg, query)? {
-        tui::Outcome::Resume(s) => launch::resume_here(&s),
-        tui::Outcome::Quit => Ok(()),
+    match (tui::run(db, cfg, query)?, mode) {
+        (tui::Outcome::Resume(s), PickMode::Resume) => launch::resume_here(&s),
+        (tui::Outcome::Resume(s), PickMode::Cmd) => {
+            println!("{}", launch::resume_command(&s));
+            Ok(())
+        }
+        (tui::Outcome::Resume(s), PickMode::Dir) => {
+            println!("{}", s.resume_dir());
+            Ok(())
+        }
+        (tui::Outcome::Quit, _) => Ok(()),
     }
+}
+
+fn shell_init(shell: &str) -> String {
+    match shell {
+        "fish" => {
+            r#"# cctrail: add to ~/.config/fish/config.fish:  cctrail shell-init fish | source
+# Alt-S opens the session picker from any prompt.
+bind \es 'cctrail </dev/tty; commandline -f repaint'
+# ccd [query]: pick a session and cd into its directory.
+function ccd
+    set -l d (cctrail pick --print-dir $argv)
+    and test -n "$d"
+    and cd $d
+end
+"#
+            .into()
+        }
+        "bash" => r#"# cctrail: add to ~/.bashrc:  eval "$(cctrail shell-init bash)"
+# Alt-S opens the session picker from any prompt.
+bind -x '"\es": cctrail </dev/tty'
+# ccd [query]: pick a session and cd into its directory.
+ccd() { local d; d="$(cctrail pick --print-dir "$@")" && [ -n "$d" ] && cd "$d"; }
+"#
+        .into(),
+        _ => r#"# cctrail: add to ~/.zshrc:  eval "$(cctrail shell-init zsh)"
+# Alt-S opens the session picker from any prompt.
+_cctrail_pick() { cctrail </dev/tty; zle reset-prompt; }
+zle -N _cctrail_pick
+bindkey '\es' _cctrail_pick
+# ccd [query]: pick a session and cd into its directory.
+ccd() { local d; d="$(cctrail pick --print-dir "$@")" && [ -n "$d" ] && cd "$d"; }
+"#
+        .into(),
+    }
+}
+
+/// URL for a session's PR / ticket / claude.ai page, by preference or by flag.
+fn open_cmd(db: &Db, target: &str, pr: bool, ticket: bool, cloud: bool, print: bool) -> Result<()> {
+    let sessions = db.load_sessions()?;
+    let prs = prview::build(&sessions, &db.load_prs()?);
+    let pr_url = |e: &PrEntry| {
+        e.meta.as_ref().and_then(|m| m.url.clone()).or_else(|| {
+            (!e.repo.is_empty()).then(|| format!("https://github.com/{}/pull/{}", e.repo, e.number))
+        })
+    };
+    let ticket_url = |k: &str| {
+        config::ticket_url(k).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no URL configured for {k}: add \"tickets\": {{\"{}\": \"https://…/browse/{{key}}\"}} to {}",
+                tickets::prefix(k),
+                config::config_path().display()
+            )
+        })
+    };
+    let url = if let Some(k) = tickets::from_text(target).into_iter().find(|k| k == target) {
+        ticket_url(&k)?
+    } else if target.starts_with('#') || target.contains("/pull/") || target.contains('#') {
+        let hits = prview::lookup(&prs, target);
+        match hits.as_slice() {
+            [e] => {
+                pr_url(e).ok_or_else(|| anyhow::anyhow!("don't know which repo {target} is in"))?
+            }
+            [] => bail!("no session touched PR {target}"),
+            _ => bail!("{target} matches several repos; use owner/repo#N"),
+        }
+    } else {
+        let s = one(&sessions, target)?;
+        let session_pr = || {
+            s.pr_summary()
+                .into_iter()
+                .find(|(l, _)| l.role.is_significant())
+                .and_then(|(l, _)| {
+                    prs.iter()
+                        .find(|e| e.repo == l.repo && e.number == l.number)
+                        .and_then(pr_url)
+                })
+        };
+        let cloud_url = || {
+            s.cloud_id
+                .as_ref()
+                .map(|c| format!("https://claude.ai/code/{c}"))
+        };
+        let ticket_first = || s.tickets.first().map(|k| ticket_url(k)).transpose();
+        if pr {
+            session_pr().ok_or_else(|| anyhow::anyhow!("{} has no PR", s.short_id()))?
+        } else if ticket {
+            ticket_first()?.ok_or_else(|| anyhow::anyhow!("{} has no ticket key", s.short_id()))?
+        } else if cloud {
+            cloud_url()
+                .ok_or_else(|| anyhow::anyhow!("{} isn't a claude.ai session", s.short_id()))?
+        } else if let Some(u) = session_pr() {
+            u
+        } else if let Some(u) = s.tickets.first().and_then(|k| config::ticket_url(k)) {
+            u
+        } else {
+            cloud_url().ok_or_else(|| {
+                anyhow::anyhow!("{} has no PR, ticket or claude.ai page", s.short_id())
+            })?
+        }
+    };
+    if print {
+        println!("{url}");
+    } else {
+        launch::open_url(&url)?;
+        eprintln!("Opened {url}");
+    }
+    Ok(())
 }
 
 fn go(db: &mut Db, cfg: &Config, query: &str, print: bool) -> Result<()> {
@@ -519,8 +826,18 @@ fn print_row(p: &Paint, s: &SessionRow, long: bool) {
         }
         None => "    ".to_string(),
     };
+    let mark = match (s.pinned, s.note.is_some()) {
+        (true, _) => p.c("33", "★ "),
+        (false, true) => p.c("33", "✎ "),
+        _ => String::new(),
+    };
+    let tickets: String = s
+        .tickets
+        .iter()
+        .map(|t| format!(" {}", p.c("36", format!("⚑{t}"))))
+        .collect();
     println!(
-        "{}  {:>4}  {}  {:<18}  {}{}",
+        "{}  {:>4}  {}  {:<18}  {mark}{}{}{tickets}",
         p.c("34", s.short_id()),
         age(s.ended.as_deref().or(s.started.as_deref())),
         ctx,
@@ -594,6 +911,21 @@ fn show(p: &Paint, s: &SessionRow, sessions: &[SessionRow], prs: &[PrEntry]) {
     println!("{}", p.dim(meta));
     if let Some(c) = s.context_summary() {
         println!("{}", p.dim(c));
+    }
+    if let Some(n) = &s.note {
+        println!("{}", p.c("33", format!("✎ {n}")));
+    }
+    if s.pinned {
+        println!("{}", p.c("33", "★ pinned"));
+    }
+    for t in &s.tickets {
+        println!(
+            "{}",
+            p.c(
+                "36",
+                format!("⚑ {t}  {}", config::ticket_url(t).unwrap_or_default())
+            )
+        );
     }
     if let Some(c) = &s.cloud_id {
         println!(
@@ -695,12 +1027,25 @@ fn print_task(p: &Paint, t: &tasks::Task, sessions: &[SessionRow], prs: &[PrEntr
         .as_ref()
         .map(|b| format!(" ⎇ {b}"))
         .unwrap_or_default();
+    let extra = format!(
+        "{}{}",
+        if t.cost_usd > 0.0 {
+            format!(" · ${:.2}", t.cost_usd)
+        } else {
+            String::new()
+        },
+        t.tickets
+            .iter()
+            .map(|k| format!(" · {k}"))
+            .collect::<String>()
+    );
     println!(
-        "{}  {}{}  {}",
+        "{}  {}{}  {}{}",
         p.bold(truncate(&t.title, 60)),
         p.c("34", &t.project),
         p.dim(branch),
-        p.c("33", format!("{} sessions", t.sessions.len()))
+        p.c("33", format!("{} sessions", t.sessions.len())),
+        p.dim(extra)
     );
     for &pi in &t.prs {
         println!(
