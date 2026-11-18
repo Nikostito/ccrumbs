@@ -1,0 +1,800 @@
+//! cctrail — find a Claude Code session fast, see what it did, and which PRs it
+//! created or reviewed, then jump straight back into it.
+
+mod config;
+mod db;
+mod describe;
+mod github;
+mod index;
+mod launch;
+mod model;
+mod parse;
+mod prdetect;
+mod prview;
+mod search;
+mod text;
+mod tui;
+
+use anyhow::{Result, bail};
+use clap::{Parser, Subcommand};
+use config::Config;
+use db::Db;
+use model::{Role, SessionRow};
+use prview::{Actor, PrEntry};
+use std::io::IsTerminal;
+use text::{age, duration, home_short, local_time, truncate};
+
+#[derive(Parser)]
+#[command(
+    name = "cctrail",
+    version,
+    about = "Find, understand and resume your Claude Code sessions — and the PRs they created or reviewed."
+)]
+struct Cli {
+    /// Skip the automatic incremental re-index before running.
+    #[arg(long, global = true)]
+    no_index: bool,
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Open the picker (default). Optional initial query, e.g. `cctrail pick #42`.
+    Pick { query: Vec<String> },
+    /// Jump straight into the best match; opens the picker if it's ambiguous.
+    Go {
+        /// Session id prefix, PR ref (#42, owner/repo#42, URL) or search words.
+        query: Vec<String>,
+        /// Print the resume command instead of running it.
+        #[arg(long)]
+        print: bool,
+    },
+    /// List recent sessions with descriptions.
+    List {
+        #[arg(short = 'n', long, default_value_t = 20)]
+        limit: usize,
+        /// Only sessions whose project path contains this.
+        #[arg(short, long)]
+        project: Option<String>,
+        /// One line per session (no description).
+        #[arg(short, long)]
+        short: bool,
+    },
+    /// Full-text search over every prompt, reply and command.
+    Search {
+        terms: Vec<String>,
+        #[arg(short = 'n', long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Everything about one session: description, PRs, files, how to resume.
+    Show { id: String },
+    /// Look up a PR by number/ref and show which sessions created, reviewed or touched it.
+    Pr {
+        /// 42, #42, owner/repo#42 or a PR URL.
+        pr: String,
+        /// Fetch fresh title/state from GitHub first (needs `gh`).
+        #[arg(long)]
+        sync: bool,
+    },
+    /// PRs your sessions created or reviewed.
+    Prs {
+        #[arg(short = 'n', long, default_value_t = 30)]
+        limit: usize,
+        /// Only PRs in repos whose name contains this.
+        #[arg(short, long)]
+        repo: Option<String>,
+        /// Only PRs born from a Claude session.
+        #[arg(long)]
+        claude: bool,
+    },
+    /// Resume a session by id prefix (in place, or in a new tab).
+    Resume {
+        id: String,
+        #[arg(long)]
+        tab: bool,
+        #[arg(long)]
+        print: bool,
+    },
+    /// Write AI titles + descriptions with Claude (needs ANTHROPIC_API_KEY).
+    Describe {
+        /// One session id; default: recent sessions that lack a description.
+        id: Option<String>,
+        #[arg(short = 'n', long, default_value_t = 20)]
+        limit: usize,
+        /// Describe every session that needs it (ignores --limit).
+        #[arg(long)]
+        all: bool,
+        /// Re-describe even if a description exists.
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// Pull PR titles/state from GitHub, and find PRs opened by claude.ai cloud sessions (needs `gh`).
+    Sync {
+        /// Repos to sync (owner/repo). Default: every repo seen in your sessions.
+        #[arg(short, long)]
+        repo: Vec<String>,
+        /// Most recently updated PRs to fetch per repo.
+        #[arg(short = 'n', long, default_value_t = 200)]
+        limit: usize,
+    },
+    /// Re-index transcripts (runs automatically before every command).
+    Index {
+        /// Re-parse everything, not just changed files.
+        #[arg(long)]
+        full: bool,
+    },
+    /// Show configuration and paths.
+    Config,
+    /// Never index projects whose path contains this.
+    Ignore { pattern: String },
+    /// Undo `ignore`.
+    Unignore { pattern: String },
+}
+
+struct Paint(bool);
+impl Paint {
+    fn c(&self, code: &str, s: impl AsRef<str>) -> String {
+        if self.0 {
+            format!("\x1b[{code}m{}\x1b[0m", s.as_ref())
+        } else {
+            s.as_ref().to_string()
+        }
+    }
+    fn dim(&self, s: impl AsRef<str>) -> String {
+        self.c("2", s)
+    }
+    fn bold(&self, s: impl AsRef<str>) -> String {
+        self.c("1", s)
+    }
+    fn role(&self, r: Role, s: impl AsRef<str>) -> String {
+        let code = match r {
+            Role::Created => "1;32",
+            Role::Reviewed => "1;35",
+            Role::Merged => "1;34",
+            Role::Commented => "33",
+            Role::WorkedOn => "36",
+            Role::Viewed | Role::Mentioned => "2",
+        };
+        self.c(code, s)
+    }
+}
+
+fn main() {
+    // Behave like a normal Unix CLI when piped into `head` & co.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+    if let Err(e) = real_main() {
+        eprintln!("cctrail: {e:#}");
+        std::process::exit(1);
+    }
+}
+
+fn real_main() -> Result<()> {
+    let cli = Cli::parse();
+    let mut cfg = Config::load();
+    let p = Paint(std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none());
+
+    if let Some(Cmd::Config | Cmd::Ignore { .. } | Cmd::Unignore { .. }) = &cli.cmd {
+        return config_cmd(cli.cmd.unwrap(), &mut cfg);
+    }
+
+    let mut db = Db::open()?;
+    if let Some(Cmd::Index { full }) = &cli.cmd {
+        let r = index::run(&mut db, &cfg, *full)?;
+        println!(
+            "Indexed {} session files from {} — {} updated, {} no longer on disk ({} ms)",
+            r.scanned,
+            cfg.projects_dir().display(),
+            r.updated,
+            r.missing,
+            r.millis
+        );
+        return Ok(());
+    }
+    if !cli.no_index {
+        index::run(&mut db, &cfg, false)?;
+    }
+
+    match cli.cmd.unwrap_or(Cmd::Pick { query: vec![] }) {
+        Cmd::Pick { query } => pick(&mut db, &cfg, &query.join(" ")),
+        Cmd::Go { query, print } => go(&mut db, &cfg, &query.join(" "), print),
+        Cmd::List {
+            limit,
+            project,
+            short,
+        } => {
+            let sessions = db.load_sessions()?;
+            let iter = sessions.iter().filter(|s| {
+                project
+                    .as_ref()
+                    .is_none_or(|pr| s.resume_dir().contains(pr.as_str()))
+            });
+            for s in iter.take(limit) {
+                print_row(&p, s, !short);
+            }
+            Ok(())
+        }
+        Cmd::Search { terms, limit } => {
+            let sessions = db.load_sessions()?;
+            let ids = db.fts(&terms.join(" "), limit)?;
+            if ids.is_empty() {
+                println!("No matches.");
+            }
+            for id in ids {
+                if let Some(s) = sessions.iter().find(|s| s.id == id) {
+                    print_row(&p, s, true);
+                }
+            }
+            Ok(())
+        }
+        Cmd::Show { id } => {
+            let sessions = db.load_sessions()?;
+            let s = one(&sessions, &id)?;
+            let prs = prview::build(&sessions, &db.load_prs()?);
+            show(&p, s, &sessions, &prs);
+            Ok(())
+        }
+        Cmd::Pr { pr, sync } => pr_cmd(&p, &db, &pr, sync),
+        Cmd::Prs {
+            limit,
+            repo,
+            claude,
+        } => {
+            let sessions = db.load_sessions()?;
+            let prs = prview::build(&sessions, &db.load_prs()?);
+            let mut n = 0;
+            for e in prs.iter().filter(|e| e.has_significant()) {
+                if claude && !e.born_from_claude() {
+                    continue;
+                }
+                if repo.as_ref().is_some_and(|r| !e.repo.contains(r.as_str())) {
+                    continue;
+                }
+                print_pr_row(&p, e, &sessions);
+                n += 1;
+                if n >= limit {
+                    break;
+                }
+            }
+            if n == 0 {
+                println!(
+                    "No PRs found. Sessions that run `gh pr create/review` or GitHub MCP tools show up here; `cctrail sync` adds PRs opened from claude.ai."
+                );
+            }
+            Ok(())
+        }
+        Cmd::Resume { id, tab, print } => {
+            let sessions = db.load_sessions()?;
+            let s = one(&sessions, &id)?;
+            if print {
+                println!("{}", launch::resume_command(s));
+                Ok(())
+            } else if tab {
+                println!("{}", launch::open_tab(s)?);
+                Ok(())
+            } else {
+                launch::resume_here(s)
+            }
+        }
+        Cmd::Describe {
+            id,
+            limit,
+            all,
+            force,
+            model,
+        } => {
+            let model = model.unwrap_or_else(|| cfg.describe_model.clone());
+            describe_cmd(
+                &p,
+                &db,
+                id,
+                if all { usize::MAX } else { limit },
+                force,
+                &model,
+            )
+        }
+        Cmd::Sync { repo, limit } => {
+            let repos = if repo.is_empty() {
+                db.known_repos()?
+            } else {
+                repo
+            };
+            if repos.is_empty() {
+                println!(
+                    "No GitHub repos seen in your sessions yet. Pass one with --repo owner/name."
+                );
+            }
+            for r in repos {
+                match github::sync_repo(&db, &r, limit) {
+                    Ok(n) => println!("{r}: {n} PRs"),
+                    Err(e) => eprintln!("{r}: {e:#}"),
+                }
+            }
+            Ok(())
+        }
+        Cmd::Index { .. } | Cmd::Config | Cmd::Ignore { .. } | Cmd::Unignore { .. } => {
+            unreachable!()
+        }
+    }
+}
+
+fn config_cmd(cmd: Cmd, cfg: &mut Config) -> Result<()> {
+    match cmd {
+        Cmd::Ignore { pattern } => {
+            if !cfg.ignored_projects.contains(&pattern) {
+                cfg.ignored_projects.push(pattern.clone());
+            }
+            cfg.save()?;
+            println!(
+                "Ignoring projects matching {pattern:?} (run `cctrail index --full` to drop already-indexed ones)"
+            );
+        }
+        Cmd::Unignore { pattern } => {
+            cfg.ignored_projects.retain(|p| p != &pattern);
+            cfg.save()?;
+            println!("No longer ignoring {pattern:?}");
+        }
+        _ => {
+            println!("config file      {}", config::config_path().display());
+            println!("index database   {}", config::db_path().display());
+            println!("transcripts      {}", cfg.projects_dir().display());
+            println!("describe model   {}", cfg.describe_model);
+            println!("ignored projects {:?}", cfg.ignored_projects);
+        }
+    }
+    Ok(())
+}
+
+fn pick(db: &mut Db, cfg: &Config, query: &str) -> Result<()> {
+    match tui::run(db, cfg, query)? {
+        tui::Outcome::Resume(s) => launch::resume_here(&s),
+        tui::Outcome::Quit => Ok(()),
+    }
+}
+
+fn go(db: &mut Db, cfg: &Config, query: &str, print: bool) -> Result<()> {
+    let sessions = db.load_sessions()?;
+    let run = |s: &SessionRow| -> Result<()> {
+        if print {
+            println!("{}", launch::resume_command(s));
+            Ok(())
+        } else {
+            launch::resume_here(s)
+        }
+    };
+    if query.trim().is_empty() {
+        return pick(db, cfg, "");
+    }
+    // 1. Session id prefix.
+    let by_id = search::by_id(&sessions, query);
+    if by_id.len() == 1 {
+        return run(by_id[0]);
+    }
+    // 2. A lone PR ref: the session that created it, else the one that reviewed it.
+    let q = search::parse(query);
+    if q.text.is_empty() && q.prs.len() == 1 {
+        let prs = prview::build(&sessions, &db.load_prs()?);
+        let (repo, n) = &q.prs[0];
+        let r = match repo {
+            Some(r) => format!("{r}#{n}"),
+            None => n.to_string(),
+        };
+        let hits = prview::lookup(&prs, &r);
+        if hits.len() == 1 {
+            let e = hits[0];
+            for actors in [e.creators(), e.reviewers()] {
+                let local: Vec<usize> = actors
+                    .iter()
+                    .filter_map(|a| {
+                        if let Actor::Local(i) = a {
+                            Some(*i)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if local.len() == 1 && !sessions[local[0]].missing {
+                    return run(&sessions[local[0]]);
+                }
+            }
+        }
+    }
+    // 3. Search; resume only when there's exactly one hit.
+    let hay: Vec<String> = sessions.iter().map(search::haystack).collect();
+    let bodies: Vec<String> = sessions.iter().map(search::body).collect();
+    let hits = search::Ranker::default().rank(&sessions, &hay, &bodies, &q);
+    if hits.len() == 1 {
+        return run(&sessions[hits[0]]);
+    }
+    if print || !std::io::stdout().is_terminal() {
+        let p = Paint(false);
+        for &i in hits.iter().take(10) {
+            print_row(&p, &sessions[i], false);
+        }
+        if hits.is_empty() {
+            bail!("no session matches {query:?}");
+        }
+        return Ok(());
+    }
+    pick(db, cfg, query)
+}
+
+fn one<'a>(sessions: &'a [SessionRow], id: &str) -> Result<&'a SessionRow> {
+    let m = search::by_id(sessions, id);
+    match m.len() {
+        0 => bail!("no session with id starting {id:?}"),
+        1 => Ok(m[0]),
+        n => bail!("{n} sessions start with {id:?} — use more characters"),
+    }
+}
+
+fn badges(p: &Paint, s: &SessionRow) -> String {
+    let mut seen = Vec::new();
+    let mut out = String::new();
+    for l in s.prs.iter().filter(|l| l.role.is_significant()) {
+        if !seen.contains(&l.number) {
+            seen.push(l.number);
+            out.push(' ');
+            out.push_str(&p.role(
+                l.role,
+                format!("{}#{} {}", l.role.icon(), l.number, l.role.as_str()),
+            ));
+        }
+    }
+    out
+}
+
+fn print_row(p: &Paint, s: &SessionRow, long: bool) {
+    println!(
+        "{}  {:>4}  {:<18}  {}{}",
+        p.c("34", s.short_id()),
+        age(s.ended.as_deref().or(s.started.as_deref())),
+        truncate(&s.project_name(), 18),
+        p.bold(truncate(&s.title(), 70)),
+        badges(p, s)
+    );
+    if long {
+        for l in s.description().lines().take(3) {
+            println!("                {}", p.dim(truncate(l, 110)));
+        }
+    }
+}
+
+fn actor(p: &Paint, sessions: &[SessionRow], a: &Actor) -> String {
+    match a {
+        Actor::Local(i) => format!(
+            "{} \"{}\"",
+            p.c("34", sessions[*i].short_id()),
+            truncate(&sessions[*i].title(), 40)
+        ),
+        Actor::Cloud(c) => format!("cloud https://claude.ai/code/{c}"),
+    }
+}
+
+fn show(p: &Paint, s: &SessionRow, sessions: &[SessionRow], prs: &[PrEntry]) {
+    println!("{}", p.bold(s.title()));
+    println!(
+        "{}  {}",
+        p.c("34", &s.id),
+        p.dim(
+            s.branch
+                .as_ref()
+                .map(|b| format!("⎇ {b}"))
+                .unwrap_or_default()
+        )
+    );
+    println!("{}", home_short(&s.resume_dir()));
+    let mut meta = format!(
+        "{} · {} prompt{}",
+        local_time(s.started.as_deref()),
+        s.user_prompts,
+        if s.user_prompts == 1 { "" } else { "s" }
+    );
+    if let Some(d) = duration(s.started.as_deref(), s.ended.as_deref()) {
+        meta.push_str(&format!(" · {d}"));
+    }
+    if s.tokens_in + s.tokens_out > 0 {
+        meta.push_str(&format!(
+            " · {} in / {} out tokens",
+            text::tokens(s.tokens_in),
+            text::tokens(s.tokens_out)
+        ));
+    }
+    if s.tests_ran {
+        meta.push_str(" · ran tests");
+    }
+    if s.commits > 0 {
+        meta.push_str(&format!(
+            " · {} commit{}",
+            s.commits,
+            if s.commits == 1 { "" } else { "s" }
+        ));
+    }
+    if let Some(m) = &s.model {
+        meta.push_str(&format!(" · {m}"));
+    }
+    println!("{}", p.dim(meta));
+    if let Some(c) = &s.cloud_id {
+        println!(
+            "{}",
+            p.dim(format!("cloud session: https://claude.ai/code/{c}"))
+        );
+    }
+    println!();
+    println!(
+        "{}",
+        p.c(
+            "1;36",
+            if s.ai_desc.is_some() {
+                "Description (AI)"
+            } else {
+                "Description"
+            }
+        )
+    );
+    for l in s.description().lines() {
+        println!("  {l}");
+    }
+    let me = sessions.iter().position(|x| x.id == s.id);
+    let linked = s.pr_summary();
+    if !linked.is_empty() {
+        println!();
+        println!("{}", p.c("1;36", "Pull requests"));
+        for (l, also) in linked {
+            let e = prs
+                .iter()
+                .find(|e| e.repo == l.repo && e.number == l.number);
+            let title = e
+                .and_then(|e| e.title())
+                .map(|t| format!("  {}", truncate(t, 50)))
+                .unwrap_or_default();
+            println!(
+                "  {}  {}#{}{}  {}",
+                p.role(l.role, format!("{} {:<9}", l.role.icon(), l.role.verb())),
+                l.repo,
+                l.number,
+                title,
+                p.dim(if also.is_empty() {
+                    l.evidence.clone()
+                } else {
+                    format!(
+                        "{} (also {})",
+                        l.evidence,
+                        also.iter()
+                            .map(|r| r.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })
+            );
+            if let Some(e) = e {
+                for (role, actors) in [
+                    (Role::Created, e.creators()),
+                    (Role::Reviewed, e.reviewers()),
+                ] {
+                    for a in actors
+                        .iter()
+                        .filter(|a| me.is_none_or(|m| **a != Actor::Local(m)))
+                    {
+                        println!(
+                            "      ↳ {} in another session: {}",
+                            p.role(role, role.as_str()),
+                            actor(p, sessions, a)
+                        );
+                    }
+                }
+            }
+        }
+    }
+    if !s.files_edited.is_empty() {
+        println!();
+        println!(
+            "{}",
+            p.c("1;36", format!("Files edited ({})", s.files_edited.len()))
+        );
+        for f in s.files_edited.iter().take(30) {
+            println!("  {}", p.dim(f));
+        }
+    }
+    println!();
+    if s.missing {
+        println!(
+            "{}",
+            p.c("31", "Transcript no longer on disk — it can't be resumed.")
+        );
+    } else {
+        println!("Resume: {}", p.bold(launch::resume_command(s)));
+    }
+    println!("{}", p.dim(format!("Transcript: {}", s.path)));
+}
+
+fn print_pr_row(p: &Paint, e: &PrEntry, sessions: &[SessionRow]) {
+    let mark = if e.born_from_claude() {
+        p.c("32", "●")
+    } else {
+        p.dim("○")
+    };
+    let state = e.state().map(|s| format!(" [{s}]")).unwrap_or_default();
+    let title = e
+        .title()
+        .map(|t| format!("  {}", truncate(t, 60)))
+        .unwrap_or_default();
+    println!("{mark} {}{}{}", p.bold(e.key()), p.dim(state), title);
+    println!("    {}", p.dim(e.story(sessions)));
+}
+
+fn pr_cmd(p: &Paint, db: &Db, q: &str, sync: bool) -> Result<()> {
+    let mut sessions = db.load_sessions()?;
+    let mut prs = prview::build(&sessions, &db.load_prs()?);
+    let mut hits: Vec<PrEntry> = prview::lookup(&prs, q).into_iter().cloned().collect();
+    if sync {
+        let mut targets: Vec<(String, u32)> = hits
+            .iter()
+            .filter(|e| !e.repo.is_empty())
+            .map(|e| (e.repo.clone(), e.number))
+            .collect();
+        if let Some((Some(r), n)) = prdetect::parse_ref(q).or_else(|| {
+            q.rsplit_once('#')
+                .and_then(|(r, n)| Some((Some(r.to_string()), n.parse().ok()?)))
+        }) && r.contains('/')
+            && !targets.contains(&(r.clone(), n))
+        {
+            targets.push((r, n));
+        }
+        for (r, n) in targets {
+            if let Err(e) = github::sync_one(db, &r, n) {
+                eprintln!("{r}#{n}: {e:#}");
+            }
+        }
+        sessions = db.load_sessions()?;
+        prs = prview::build(&sessions, &db.load_prs()?);
+        hits = prview::lookup(&prs, q).into_iter().cloned().collect();
+    }
+    if hits.is_empty() {
+        bail!("no session touched PR {q:?} (try `cctrail pr {q} --sync` or `cctrail sync`)");
+    }
+    for (i, e) in hits.iter().enumerate() {
+        if i > 0 {
+            println!("\n{}", p.dim("─".repeat(60)));
+        }
+        let state = e.state().map(|s| format!("  [{s}]")).unwrap_or_default();
+        println!("{}{}", p.bold(e.key()), p.dim(state));
+        if let Some(t) = e.title() {
+            println!("{}", p.bold(t));
+        }
+        if let Some(u) = e.meta.as_ref().and_then(|m| m.url.clone()) {
+            println!("{}", p.dim(u));
+        }
+        if e.born_from_claude() {
+            println!("{}", p.c("32", "Born from a Claude session"));
+        }
+        println!();
+        println!("{}", p.c("33", e.story(&sessions)));
+        println!();
+        for (l, also) in e.grouped() {
+            let also = if also.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " (also {})",
+                    also.iter()
+                        .map(|r| r.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            match l.session {
+                Some(si) => {
+                    let s = &sessions[si];
+                    println!(
+                        "  {}  {}  {}  {}",
+                        p.role(l.role, format!("{} {:<9}", l.role.icon(), l.role.verb())),
+                        p.c("34", s.short_id()),
+                        p.dim(local_time(l.ts.as_deref().or(s.started.as_deref()))),
+                        truncate(&s.title(), 60)
+                    );
+                    println!(
+                        "               {}",
+                        p.dim(format!(
+                            "{} · {}{also}",
+                            home_short(&s.resume_dir()),
+                            l.evidence
+                        ))
+                    );
+                }
+                None => {
+                    println!(
+                        "  {}  {}  {}",
+                        p.role(l.role, format!("{} {:<9}", l.role.icon(), l.role.verb())),
+                        p.c("34", "cloud   "),
+                        l.cloud_id
+                            .as_ref()
+                            .map(|c| format!("https://claude.ai/code/{c}"))
+                            .unwrap_or_default()
+                    );
+                    println!("               {}", p.dim(&l.evidence));
+                }
+            }
+        }
+        let go_to = e.creators().into_iter().chain(e.reviewers()).find_map(|a| {
+            if let Actor::Local(i) = a {
+                Some(i)
+            } else {
+                None
+            }
+        });
+        if let Some(i) = go_to {
+            println!();
+            println!(
+                "Jump in: {}",
+                p.bold(format!("cctrail go {}", sessions[i].short_id()))
+            );
+        }
+    }
+    Ok(())
+}
+
+fn describe_cmd(
+    p: &Paint,
+    db: &Db,
+    id: Option<String>,
+    limit: usize,
+    force: bool,
+    model: &str,
+) -> Result<()> {
+    let sessions = db.load_sessions()?;
+    let targets: Vec<&SessionRow> = match &id {
+        Some(id) => vec![one(&sessions, id)?],
+        None => sessions
+            .iter()
+            .filter(|s| !s.missing && (force || describe::needs_description(db, s)))
+            .take(limit)
+            .collect(),
+    };
+    if targets.is_empty() {
+        println!("Every session already has a description.");
+        return Ok(());
+    }
+    describe::check_auth()?;
+    eprintln!("Describing {} session(s) with {model}…", targets.len());
+    // Network-bound: run a few requests at once, write results serially.
+    let inputs: Vec<(&SessionRow, Vec<String>, Option<String>, i64)> = targets
+        .iter()
+        .filter_map(|s| {
+            db.prompts_and_reply(&s.id)
+                .ok()
+                .map(|(pr, r, z)| (*s, pr, r, z))
+        })
+        .collect();
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build()?;
+    let results: Vec<_> = pool.install(|| {
+        use rayon::prelude::*;
+        inputs
+            .par_iter()
+            .map(|(s, pr, r, z)| (*s, *z, describe::ai_describe(s, pr, r.as_deref(), model)))
+            .collect()
+    });
+    let mut failed = 0;
+    for (s, size, r) in results {
+        match r {
+            Ok((t, d)) => {
+                db.set_ai(&s.id, &t, &d, model, size)?;
+                println!("{}  {}", p.c("34", s.short_id()), p.bold(&t));
+                println!("          {}", p.dim(&d));
+            }
+            Err(e) => {
+                failed += 1;
+                eprintln!("{}  {e:#}", s.short_id());
+            }
+        }
+    }
+    if failed > 0 {
+        bail!("{failed} of {} descriptions failed", inputs.len());
+    }
+    Ok(())
+}
