@@ -1,338 +1,393 @@
-# cctrail
+# ccrumbs
 
-Find a Claude Code session in seconds, see what it did and which PRs it
-**created** or **reviewed**, and jump straight back into it.
+**Find a Claude Code session in seconds, see what it did and which PRs it
+created or reviewed, and jump straight back into it.**
 
-![cctrail: session list with descriptions and PR badges](docs/sessions.png)
+![ccrumbs: sessions grouped by day, with a detail card for the selected one](https://raw.githubusercontent.com/nikostito/ccrumbs/main/docs/sessions.png)
 
-The list is short and grouped (Pinned, Here, Today, Yesterday, This week…);
-the right side is a card with the facts, what happened, the PR and who did
-what, and other sessions in the same task.
+Claude Code keeps every conversation on disk, but finding *the* session you
+want to continue means scrolling `claude --resume` or digging through JSONL
+files. ccrumbs indexes them locally and gives you:
 
-Type a few words (or `#123` for a PR), press **Enter**, and you're back in
-that session: cctrail `cd`s into its directory and runs
-`claude --resume <id>` for you. Started inside a repo, it puts that repo's
-sessions first (● same branch, ○ same repo). Inside a repo, plain
-`cctrail go` continues the latest session on your branch.
+- **A picker that starts where you are.** Run it inside a repo and that
+  branch's sessions come first. Type a few words, `#123` for a PR or
+  `ABC-123` for a ticket, press **Enter**, and you're back in the session, in
+  its directory.
+- **A description of every session**: what you asked, what followed, files
+  edited, tests run, commits and PRs. Optionally, Claude writes a short title
+  and summary.
+- **Which PRs came from Claude sessions, and who did what**, e.g. *"Created by
+  session A · reviewed by a DIFFERENT session: B"*.
+- **Tasks**: sessions that worked on the same branch, PR or ticket, grouped
+  into one story.
+- **Context fill and cost per session**, so you can tell whether to resume a
+  session or start fresh.
+- **A conversation viewer, notes, pins, Markdown export, Jira/Linear links,
+  editor integration**, and an **MCP server** so Claude can search your past
+  sessions too.
 
-## What it gives you
-
-- **A description for every session.** Each session gets one for free at
-  index time: what you asked, what followed, which files were edited,
-  whether tests ran, commits, and PRs. `cctrail describe` can also have
-  Claude write a short title and summary (needs `ANTHROPIC_API_KEY`).
-- **PRs born from Claude sessions.** cctrail reads the transcripts for
-  `gh pr create`, `gh pr review/merge/comment`, `gh api …/pulls/…`,
-  GitHub MCP tools (`create_pull_request`, `pull_request_review_write`, …),
-  and prompts like `/review 42` or "review https://github.com/o/r/pull/7".
-  Failed commands and text inside heredocs or quoted strings don't count.
-- **PR lookup by number.** `cctrail pr 42` (or `#42`, `owner/repo#42`, or a
-  PR URL) lists every session that touched the PR and says how.
-- **Created by one session, reviewed by another, stated plainly.** The PRs
-  tab tells each PR's story:
-
-  ![PRs tab: who created and who reviewed each PR](docs/prs-tab.png)
-
-  You'll see one of: *"Created by A · reviewed by a DIFFERENT session: B"*,
-  *"Created and reviewed in the SAME session"*, or *"Reviewed by B · created
-  outside your Claude sessions"*. A session's detail view also says
-  *"↳ created in another session: …"* next to PRs it only reviewed.
-- **Context fill and cost per session.** Each session shows how full its
-  context window was when it ended (green under 50%, yellow under 80%, red
-  above), how many times it was compacted, and what it cost, taken from
-  Claude Code's own cost tally. A session at 87% is close to compacting
-  again, so it's often better to start fresh than to resume it.
-  `ctx:>80` finds those sessions.
-- **Starts where you are.** Run it inside a repo and sessions from your
-  current branch come first, then the rest of that repo, then everything
-  else. `Ctrl-G` switches to plain newest-first.
-- **Tasks: sessions that belong together.** Sessions that worked on the same
-  branch, or on the same PR (created it, reviewed it, addressed the review),
-  are grouped into one task. The Tasks view shows the whole story in order,
-  and each session's preview lists its earlier and later sessions:
-
-  ![Tasks view: three sessions behind one PR](docs/tasks.png)
-
-- **Filters you can type.** `p:api`, `b:feat`, `f:ratelimit.rs` (a file it
-  edited), `repo:acme/web`, `has:pr`, `@today`, `@yesterday`, `@week`,
-  `@3d`, and `#88`, all combinable with plain words. `Ctrl-T` hides one-off
-  quick questions.
-
-  ![Filtering by an edited file](docs/filters.png)
-
-- **Read before you resume.** `Ctrl-V` opens the whole conversation
-  (prompts, replies, tool calls; `o` shows tool output) with `/` search, so
-  you can check it's the right session. Enter resumes it from there.
-
-  ![Reading a session](docs/viewer.png)
-
-- **Jira and Linear tickets.** Keys like `ABC-123` are picked up from branch
-  names (`feature/ABC-123-…`, `nikos/eng-42-…`), prompts and titles. They
-  show next to the session, are searchable (type `ABC-123`), group sessions
-  into one task, and `Ctrl-K` opens the ticket. The first time, cctrail asks
-  for your Jira or Linear address (paste any ticket link) and remembers it;
-  or set it with `cctrail tickets set ABC https://yourcompany.atlassian.net`.
-- **Opens in your editor.** `Ctrl-E` opens the session's project in the
-  editor you picked. The first time, it lists the editors it finds (VS Code,
-  Cursor, Zed, JetBrains IDEs, Neovim and others, including macOS apps
-  without a command-line launcher) and remembers your choice. Change it with
-  `Ctrl-A i` or `cctrail editor set <name>`.
-
-  ![Choosing an editor](docs/editor.png)
-
-- **Pins, notes and cleanup.** `Ctrl-S` pins the sessions you're juggling to
-  the top. Notes (`Ctrl-A n`) show in the preview and are searchable.
-  Sessions you'll never need again can be hidden (`Ctrl-A h`).
-- **One menu for everything else.** `Ctrl-A` lists every action for the
-  selection: open its PR, ticket or claude.ai page, open the project in your
-  editor, export as Markdown, describe with Claude, copy the id, and so on.
-
-  ![The actions menu](docs/actions.png)
-
-- **Claude can search your history too.** `cctrail mcp` is an MCP server,
-  so inside a session you can ask *"how did we fix the redis bucket issue
-  last time?"* (see [Use from Claude Code](#use-from-claude-code-mcp)).
-- **Fast.** It's written in Rust: transcripts are parsed in parallel, and
-  only files that changed are re-parsed, on every launch. Measured on 4 cores:
-
-  | History | First index | Launch, nothing changed | Launch, a 14 MB session grew | Commands |
-  |---|---|---|---|---|
-  | 100 realistic sessions, 207 MB | 0.2 s | 1 ms | 33 ms | 7–14 ms |
-  | 2,000 synthetic sessions, 641 MB | ~4 s | 10 ms | | |
+Everything runs locally. Nothing leaves your machine unless you use one of
+the features listed under [Privacy](#privacy).
 
 ## Install
 
-You need a Rust toolchain ([rustup.rs](https://rustup.rs)).
+**Prebuilt binaries** for macOS (Apple Silicon and Intel), Linux (x86_64 and
+arm64) and Windows are on the
+[releases page](https://github.com/nikostito/ccrumbs/releases). Download one,
+unpack it, and put `ccrumbs` somewhere on your `PATH`.
+
+**With Cargo** (Rust 1.89 or newer):
 
 ```bash
-cargo install --git https://github.com/nikostito/cctrail --locked
+cargo install ccrumbs --locked
 ```
 
-Or, from a clone, run `cargo install --path . --locked`. That puts a single
-`cctrail` binary in `~/.cargo/bin`.
+or the latest code from GitHub:
 
-## Everyday use
+```bash
+cargo install --git https://github.com/nikostito/ccrumbs --locked
+```
 
-| Command | What it does |
+Then run:
+
+```bash
+ccrumbs
+```
+
+The first run indexes `~/.claude/projects`. That takes well under a second
+for a typical history, or a few seconds if the files aren't in the disk cache
+yet. After that, every launch only re-reads sessions that changed.
+
+> **Coming from cctrail?** This project used to be called cctrail. Your index,
+> pins, notes and settings in `~/.cctrail` are copied to `~/.ccrumbs`
+> automatically the first time you run `ccrumbs`. The old `CCTRAIL_*`
+> environment variables still work.
+
+## The picker
+
+The left side is a short list grouped as **Pinned**, **Here** (the repo and
+branch you started in), **Today**, **Yesterday**, **This week** and older.
+The right side is a card for the selected session:
+
+- **Facts:** project, branch, prompts, a context bar, cost and model.
+- **What happened**, and a **Next** hint when its context is nearly full.
+- **Pull requests:** its PRs and who created and reviewed them.
+- **Same task:** other sessions in the same task.
+- **Files edited.**
+
+Press **Tab** to switch between **Sessions**, **Tasks** and **PRs**:
+
+| Tasks | PRs |
 |---|---|
-| `cctrail` | Open the picker |
-| `cctrail go` | Inside a repo: continue the latest session on this branch (else this repo) |
-| `cctrail go <words / id / #PR / filters>` | Jump straight in when there's exactly one match; otherwise open the picker with that query |
-| `cctrail tasks` | Sessions grouped by task, with each one's role on the task's PRs |
-| `cctrail pr 42` | Who created / reviewed / merged PR 42, then `cctrail go <id>` |
-| `cctrail prs [--claude] [--repo web]` | PRs your sessions created or reviewed; `--claude` keeps only the ones born from a Claude session |
-| `cctrail list [query] [-n 50] [-s]` | Recent sessions with descriptions, e.g. `cctrail list f:auth @week` |
-| `cctrail search <words>` | Full-text search across every prompt, reply and shell command |
-| `cctrail show <id>` | Everything about one session |
-| `cctrail resume <id> [--tab \| --print]` | Resume here, in a new terminal tab, or just print the command |
-| `cctrail view <id> [--outputs]` | Print the conversation (pipe to `less -R`) |
-| `cctrail export <id> [-o file.md \| -o -]` | Summary, PRs, tickets, files and conversation as Markdown |
-| `cctrail open <id \| #PR \| ABC-123> [--pr\|--ticket\|--cloud] [--print]` | Open the session's PR, ticket or claude.ai page |
-| `cctrail pin <id>` / `unpin` · `note <id> [text]` · `hide <id>` / `unhide` | Your own marks; `note <id>` with no text clears it |
-| `cctrail edit <id>` | Open the session's project in your editor |
-| `cctrail editor [set <name> \| reset]` | Show / choose the editor (`set cursor`, `set pycharm`, `set "code -n"`) |
-| `cctrail tickets [set <PREFIX> <url> \| remove <PREFIX>]` | Show / set Jira and Linear links; the URL can be your site or any ticket link |
-| `cctrail dir <id>` | Print the session's directory: `cd "$(cctrail dir a1b2)"` |
-| `cctrail pick --print-dir` / `--print` | Pick interactively, print the directory / resume command |
-| `cctrail shell-init zsh\|bash\|fish` | Key binding and `ccd` helper (see below) |
-| `cctrail mcp` | MCP server for Claude Code (see below) |
+| ![Tasks view](https://raw.githubusercontent.com/nikostito/ccrumbs/main/docs/tasks.png) | ![PRs view](https://raw.githubusercontent.com/nikostito/ccrumbs/main/docs/prs.png) |
 
-Session ids can be abbreviated to their first few characters, like git
-hashes.
-
-![cctrail pr 88 and cctrail tasks](docs/cli-pr.png)
-
-### Picker keys
-
-Typing `#88` keeps only the sessions linked to that PR, with the one that
-created it first:
-
-![Searching #88 in the picker](docs/search-pr.png)
-
-Plain words match titles, projects, branches, descriptions and prompts.
 Press `?` (with an empty search) for every key and filter:
 
-![Keys and filters](docs/help.png)
+![Keys and filters](https://raw.githubusercontent.com/nikostito/ccrumbs/main/docs/help.png)
+
+### Keys
 
 | Key | Action |
 |---|---|
-| typing | filter (fuzzy on title, project, branch, PR numbers; falls back to description and prompts) |
-| `#42`, `acme/web#42`, PR URL | only sessions linked to that PR, creator first |
-| `p:` `b:` `f:` `repo:` `has:pr` | project, branch, edited file, repo, did PR work |
-| `@today` `@yesterday` `@week` `@month` `@3d` `@2w` | last active in that window |
-| `ctx:>80`, `ctx:<30` | how full the context window was at the end |
-| `ABC-123`, `t:abc-123` | sessions linked to that ticket |
-| `is:pinned` `has:note` `is:hidden` | your marks (hidden sessions only show with `is:hidden`) |
+| typing | search titles, projects, branches, PR numbers, tickets, descriptions and prompts |
 | **Enter** | resume the session (in Tasks / PRs: list that task's or PR's sessions) |
-| **Tab** / **Shift-Tab** | cycle Sessions → Tasks → PRs |
-| `Ctrl-G` | toggle "here first" ranking (repo and branch you started in) |
-| `Ctrl-T` | hide / show one-off quick sessions (1 prompt, no edits, no PRs) |
-| `Ctrl-A` | actions menu for the selection (everything below, plus export, note, hide, copy id) |
-| `Ctrl-V` | read the conversation (`/` find, `n`/`N` next/prev, `o` tool output, Enter resume, Esc back) |
-| `Ctrl-K` | open the Jira / Linear ticket (asks for the link the first time) |
-| `Ctrl-S` | pin / unpin |
-| `Ctrl-E` | open the project in your editor (asks which one the first time; `Ctrl-A i` to change) |
-| `Ctrl-O` | resume in a new tab of the terminal you're in: tmux, zellij, WezTerm, kitty, iTerm2, Terminal, Ghostty, Warp, GNOME Terminal, Konsole, Windows Terminal |
-| `Ctrl-Y` | copy `cd … && claude --resume …` |
-| `Ctrl-F` | toggle full-text search |
-| `Ctrl-D` | have Claude describe the selected session |
-| `Ctrl-B` | open the session's PR in your browser (else its claude.ai page) |
-| `Ctrl-R` | re-index |
-| `←` / `→` | scroll the preview |
-| `?` | keys and filters (when the search box is empty) |
-| `Esc` | clear the query, or quit |
+| **Tab** / **Shift-Tab** | Sessions → Tasks → PRs |
+| `^v` | read the whole conversation (`/` find, `n`/`N` next/previous, `o` tool output, Enter to resume) |
+| `^b` / `^k` | open the PR / the Jira or Linear ticket in your browser |
+| `^e` | open the project in your editor (asks which one the first time) |
+| `^o` | resume in a new tab of your terminal |
+| `^y` | copy `cd … && claude --resume …` |
+| `^s` | pin / unpin |
+| `^a` or `F2` | all actions: note, hide, export, describe with Claude, copy id, choose editor… |
+| `^g` | toggle "sessions from here first" |
+| `^t` | hide one-off quick sessions (one prompt, no edits, no PRs) |
+| `^f` | full-text search over every prompt, reply and shell command |
+| `^d` | describe the session with Claude |
+| `^r` | re-index |
+| `←` / `→` | scroll the card |
+| `?` or `F1` | keys and filters |
+| `Esc` | clear the search, or quit |
+
+**Alt works like Ctrl** (`Alt-b` = `^b`). Use it when tmux, zellij or your
+editor's terminal takes a Ctrl shortcut for itself.
+
+![The actions menu](https://raw.githubusercontent.com/nikostito/ccrumbs/main/docs/actions.png)
+
+### Search filters
+
+Filters can be combined with each other and with plain words, in the picker,
+`ccrumbs go` and `ccrumbs list`:
+
+| Filter | Matches |
+|---|---|
+| `#88`, `acme/web#88`, a PR URL | sessions linked to that PR (the one that created it first) |
+| `ABC-123`, `t:abc-123` | sessions linked to that ticket |
+| `p:api` · `b:feat` · `f:ratelimit` | project · branch · a file the session edited |
+| `repo:acme/web` | the session's GitHub repo |
+| `@today` `@yesterday` `@week` `@month` `@3d` `@2w` `@12h` | last active in that window |
+| `has:pr` · `has:note` · `is:pinned` · `is:hidden` | sessions with PR work · a note · pinned · hidden |
+| `ctx:>80` · `ctx:<30` | how full the context window was at the end |
+
+![Filtering by an edited file](https://raw.githubusercontent.com/nikostito/ccrumbs/main/docs/filters.png)
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `ccrumbs` | open the picker |
+| `ccrumbs go` | inside a repo: continue the latest session on this branch (else this repo) |
+| `ccrumbs go <words \| id \| #PR \| filters>` | jump straight in when exactly one session matches; otherwise open the picker with that query |
+| `ccrumbs list [query] [-n 50] [-s]` | recent sessions with descriptions, e.g. `ccrumbs list f:auth @week` |
+| `ccrumbs search <words>` | full-text search |
+| `ccrumbs show <id>` | everything about one session |
+| `ccrumbs pr 42` | which sessions created, reviewed or merged PR 42 |
+| `ccrumbs prs [--claude] [--repo web]` | PRs your sessions worked on; `--claude` keeps the ones born from a Claude session |
+| `ccrumbs tasks` | sessions grouped by task |
+| `ccrumbs view <id> [--outputs]` | print the conversation |
+| `ccrumbs export <id> [-o file.md \| -o -] [--force]` | the session as Markdown: summary, PRs, tickets, files, conversation |
+| `ccrumbs open <id \| #PR \| ABC-123> [--pr\|--ticket\|--cloud] [--print]` | open the session's PR, ticket or claude.ai page |
+| `ccrumbs resume <id> [--tab \| --print]` | resume here, in a new tab, or print the command |
+| `ccrumbs pin` / `unpin` / `hide` / `unhide <id>` | your own marks |
+| `ccrumbs note <id> [text]` | set a note (no text clears it); notes are searchable |
+| `ccrumbs edit <id>` | open the session's project in your editor |
+| `ccrumbs editor [set <name> \| reset]` | show or choose the editor (`set cursor`, `set pycharm`, `set "code -n"`) |
+| `ccrumbs tickets [set <PREFIX> <url> \| remove <PREFIX>]` | Jira / Linear links |
+| `ccrumbs sync [--repo owner/name]` | fetch PR titles and state from GitHub (needs `gh`) |
+| `ccrumbs describe [<id> \| --all]` | AI titles and descriptions (needs an Anthropic API key) |
+| `ccrumbs mcp` | MCP server for Claude Code |
+| `ccrumbs shell-init zsh\|bash\|fish` | Alt-S key binding and a `ccd` helper |
+| `ccrumbs completions <shell>` | tab completion for bash, zsh, fish, PowerShell or elvish |
+| `ccrumbs dir <id>` | print the session's directory: `cd "$(ccrumbs dir a1b2)"` |
+| `ccrumbs index [--full]` | re-index (runs automatically before every command) |
+| `ccrumbs config` · `ignore <text>` · `unignore <text>` | show paths and settings · stop or resume indexing matching projects |
+
+Session ids can be shortened to their first few characters (at least 4), like
+git hashes.
+
+![ccrumbs pr 88 and ccrumbs tasks](https://raw.githubusercontent.com/nikostito/ccrumbs/main/docs/cli.png)
+
+## Pull requests
+
+ccrumbs reads each transcript for evidence of what the session did with a PR:
+
+| Role | Evidence |
+|---|---|
+| ● created | `gh pr create` (the number comes from its output), `gh api -X POST …/pulls`, the GitHub MCP tool `create_pull_request`, or a synced PR whose description links the session |
+| ♦ reviewed | `gh pr review`, review POSTs to `…/pulls/N/reviews`, the MCP review tools, `/review N` or `/code-review N`, or a prompt asking for a review |
+| √ merged | `gh pr merge`, MCP `merge_pull_request` |
+| » commented | `gh pr comment`, `…/issues/N/comments`, MCP `add_issue_comment` (left out when the result shows the number is an issue, not a PR) |
+| ► worked on | `gh pr checkout/edit`, MCP `update_pull_request`, "address the review comments on #N", or the PR's branch |
+| · viewed / mentioned | `gh pr view/diff`, MCP `pull_request_read`, PR links in prompts or replies |
+
+Text inside heredocs and quoted strings, and commands that failed, don't
+count. A bare `#42` is matched to a repo using `-R owner/repo`, the session's
+other PR links (so forks work), its directory's `origin` remote (SSH host
+aliases included), or `git push` output.
+
+`ccrumbs sync` uses the [GitHub CLI](https://cli.github.com) to fetch PR
+titles and state. It also finds PRs opened from **claude.ai** web sessions:
+those have the session link in their description, even when there's no
+transcript on your machine.
+
+## Tasks
+
+Two sessions are part of the same task when they share a ticket key, worked
+on the same branch (other than `main`, `master`, `develop`, `dev` or
+`trunk`) of the same repo, or did something concrete with the same PR. The
+Tasks view tells each task's story in order and suggests a next step. Each
+session's card lists the other sessions in its task.
+
+## Tickets (Jira, Linear, …)
+
+Keys like `ABC-123` are picked up from branch names (`feature/ABC-123-login`,
+`you/eng-42-dark-mode`), prompts and titles. They show on the session card,
+are searchable, and group sessions into tasks. Press `^k` to open one. The
+first time you do, ccrumbs asks for your tracker's address. You can paste
+your Jira site, your Linear workspace or any ticket link, or set it ahead of
+time:
+
+```bash
+ccrumbs tickets set ABC https://yourcompany.atlassian.net
+```
+
+```bash
+ccrumbs tickets set ENG https://linear.app/yourteam
+```
+
+`ccrumbs tickets` shows the links you've set and the ticket prefixes in your
+sessions that have none. A key in a branch name is always used. A key that
+only appears in a prompt is used when its prefix has a link or appears in
+some branch name; that keeps things like `UTF-8` out.
+
+## Editors and terminal tabs
+
+`^e` (or `ccrumbs edit <id>`) opens the project in your editor. The first
+time, ccrumbs lists the editors it finds and remembers your choice: VS Code,
+Cursor, Windsurf, Zed, Sublime Text, JetBrains IDEs, Neovim, Vim, Helix,
+Emacs and others. On macOS, that includes apps without their command-line
+launcher installed. Terminal editors take over the screen until you quit
+them.
+
+![Choosing an editor](https://raw.githubusercontent.com/nikostito/ccrumbs/main/docs/editor.png)
+
+`^o` opens a new tab in the terminal you're using and resumes the session
+there. That works in tmux, zellij, WezTerm, kitty, iTerm2, Terminal.app,
+Ghostty, Warp, GNOME Terminal, Konsole, xfce4-terminal and Windows Terminal.
+
+- **Terminal.app, Ghostty and Warp:** ccrumbs presses ⌘T for you, so macOS
+  asks once to allow your terminal under *Privacy & Security →
+  Accessibility*.
+- **Anywhere else**, `^y` copies the command instead.
+
+## Reading, notes, export
+
+- `^v` opens the whole conversation, with search. Press Enter there to
+  resume.
+
+  ![Reading a session](https://raw.githubusercontent.com/nikostito/ccrumbs/main/docs/viewer.png)
+
+- Notes (`^a n`) appear on the card and are searchable. Pins (`^s`) keep the
+  sessions you're juggling at the top. Hiding (`^a h`) removes a session from
+  lists and search; `is:hidden` shows hidden sessions again.
+- `ccrumbs export <id>` writes the session as Markdown, ready for a PR
+  description, a ticket or a teammate.
 
 ## AI descriptions
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-cctrail describe            # the 20 most recent sessions without one
-cctrail describe --all      # every session that needs one
-cctrail describe a1b2c3d4   # one session (or Ctrl-D in the picker)
 ```
-
-Claude gets a compact digest of the session: your prompts, files edited,
-PR roles, and the end of the last reply. It writes back a title of up to 8
-words and a one- or two-sentence summary, which are cached in the index.
-Sessions are described again only after they grow noticeably. The default
-model is `claude-opus-5-5` at low effort; set `"describe_model"` in the
-config or pass `--model` to change it.
-
-## Cloud sessions (claude.ai/code) and GitHub sync
-
-PRs opened from claude.ai cloud sessions carry a `claude.ai/code/session_…`
-link in their body. With the [GitHub CLI](https://cli.github.com)
-logged in:
 
 ```bash
-cctrail sync                       # every repo seen in your sessions
-cctrail sync --repo acme/web -n 500
-cctrail pr 42 --sync               # refresh one PR
+ccrumbs describe             # the 20 most recent sessions without one
+ccrumbs describe --all       # every session that needs one
+ccrumbs describe a1b2c3d4    # one session (or ^d in the picker)
 ```
 
-This fetches PR titles and state, and marks PRs whose body links a cloud
-session, or carries the "Generated with Claude Code" footer, as **born from
-Claude**, even when there's no transcript on this machine. It also links
-sessions that worked on a PR's head branch.
+Claude reads a compact digest of the session and writes a title of up to 8
+words and a one- or two-sentence summary. The digest has the project and
+branch, your first prompts, files edited, PR roles and the end of Claude's
+last reply. Results are cached, and a session is described again only after
+it grows noticeably.
 
-## Shell integration
-
-```bash
-eval "$(cctrail shell-init zsh)"     # or bash; fish: cctrail shell-init fish | source
-```
-
-This gives you **Alt-S** to open the picker from any prompt, and
-**`ccd [query]`** to pick a session and `cd` into its directory without
-resuming it. `ccd` uses `cctrail pick --print-dir`; the picker draws on
-stderr, so command substitution works.
+- **Model:** `claude-opus-5-5` at low effort. Change it with `--model`, or
+  set `"describe_model"` in the config.
+- **Cost:** API calls are billed to your key. Use `-n` or a single id to stay
+  in control.
 
 ## Use from Claude Code (MCP)
 
 ```bash
-claude mcp add cctrail -- cctrail mcp
+claude mcp add ccrumbs -- ccrumbs mcp
 ```
 
-Claude then gets four tools that work on your local index:
+Claude gets four tools that read your local index:
 
-| Tool | What it returns |
+| Tool | Returns |
 |---|---|
-| `search_sessions` | Sessions matching a query (same syntax as the picker, or full-text) |
-| `get_session` | Description, prompts, files, PRs (and who else created or reviewed them), notes, last reply, resume command |
-| `read_transcript` | The conversation; with `query`, just the passages that mention it |
-| `find_pr` | Which sessions created, reviewed or worked on a PR |
+| `search_sessions` | sessions matching a query (the same syntax as the picker, or full-text) |
+| `get_session` | description, prompts, files, PRs (and who else created or reviewed them), notes, last reply, resume command |
+| `read_transcript` | the conversation; with `query`, only the passages that mention it |
+| `find_pr` | which sessions created, reviewed or worked on a PR |
 
-Ask things like *"find the session where we added rate limiting and tell me
-how the bucket was shared"* or *"who reviewed PR 88?"*. It only reads
-transcripts on your machine and re-indexes incrementally before each call.
+Then ask things like *"find the session where we added rate limiting and tell
+me how the bucket was shared"* or *"who reviewed PR 88?"*.
 
-## How tasks are formed
+## Shell integration
 
-Two sessions land in the same task when they share a ticket key, or when they:
+```bash
+eval "$(ccrumbs shell-init zsh)"      # or bash; fish: ccrumbs shell-init fish | source
+```
 
-- worked on the same non-default branch (anything but `main`, `master`,
-  `develop`, `dev` or `trunk`) of the same repo, or
-- both did something concrete with the same PR: created, reviewed, merged,
-  commented on, or worked on it.
+This gives you **Alt-S** to open the picker from any prompt, and **`ccd
+[query]`** to pick a session and `cd` into its directory without resuming it.
+For tab completion:
 
-The task's title is the PR title when one is known (after `cctrail sync`),
-otherwise the branch name. Only groups of two or more sessions are listed.
-
-## How detection works
-
-| Role | Evidence |
-|---|---|
-| ● created | `gh pr create` (number taken from its output), `gh api -X POST repos/o/r/pulls`, MCP `create_pull_request`, or a synced PR whose body links this session |
-| ♦ reviewed | `gh pr review`, review/comment POSTs to `…/pulls/N/reviews`, MCP review tools, `/review N` / `/code-review N`, or a prompt asking to review a PR |
-| √ merged | `gh pr merge`, MCP `merge_pull_request` |
-| » commented | `gh pr comment`, `…/issues/N/comments`, MCP `add_issue_comment` |
-| ► worked on | `gh pr checkout/edit`, MCP `update_pull_request`, PR activity subscriptions, "address the review comments on #N", or the PR's head branch |
-| · viewed / mentioned | `gh pr view/diff`, MCP `pull_request_read`, PR URLs in prompts or replies |
-
-A bare `#42` is resolved to a repo using, in order: `-R owner/repo`, the
-session directory's `origin` remote, `git push` output in the transcript,
-and other PR URLs in the same session.
+```bash
+ccrumbs completions zsh > ~/.zfunc/_ccrumbs   # bash, fish, powershell, elvish too
+```
 
 ## Configuration
 
-`cctrail config` shows the paths in use. `~/.cctrail/config.json`:
+`ccrumbs config` shows the paths in use. `~/.ccrumbs/config.json` (every key
+is optional):
 
 ```json
 {
   "claude_projects_dir": null,
   "ignored_projects": [],
   "describe_model": "claude-opus-5-5",
-  "context_windows": {},
   "theme": "dark",
   "editor": "cursor",
-  "tickets": {
-    "ABC": "https://acme.atlassian.net/browse/{key}",
-    "ENG": "https://linear.app/acme/issue/{key}"
-  }
+  "tickets": { "ABC": "https://yourcompany.atlassian.net/browse/{key}" },
+  "context_windows": {}
 }
 ```
 
-- `claude_projects_dir` defaults to `$CLAUDE_CONFIG_DIR/projects` or
-  `~/.claude/projects`.
-- `context_windows` overrides the context size used for the context percentage,
-  matched as a substring of the model id, e.g. `{"sonnet-4-5": 1000000}`.
-  Built in: 1M for the Claude 5 family, Opus 4.6–4.8, Sonnet 4.6 and `[1m]`
-  models; 200k for the rest.
-- `theme`: `"dark"` (default) draws the TUI in its own gray-black colors, so
-  it looks the same in any terminal; `"terminal"` uses your terminal's
-  palette instead.
-- `editor` is set for you when you pick one (`Ctrl-E`, `cctrail editor set`).
-  Any shell command works; the project folder is added at the end.
-  `$CCTRAIL_EDITOR` is used if nothing is set.
-- `tickets` maps a ticket prefix to its URL (`{key}` is replaced; `"*"`
-  matches any prefix). You don't need to edit it by hand: `cctrail tickets
-  set` and the `Ctrl-K` prompt write it. Keys in branch names are always picked up. A key that
-  appears only in a prompt counts when its prefix is listed here, or was seen
-  in some branch name. That keeps things like `UTF-8` and `SHA-256` out.
-- `cctrail ignore <substring>` / `cctrail unignore <substring>` stops (or
-  resumes) indexing matching projects.
-- `CCTRAIL_HOME` moves the index and config elsewhere.
-- `--no-index` skips the automatic incremental index for one command.
+| Key | Meaning |
+|---|---|
+| `claude_projects_dir` | where the transcripts are; default `$CLAUDE_CONFIG_DIR/projects` or `~/.claude/projects` |
+| `ignored_projects` | path fragments to never index (`ccrumbs ignore <text>`) |
+| `describe_model` | model for `ccrumbs describe` |
+| `theme` | `"dark"` (the default; its own gray-black colours, the same in any terminal) or `"terminal"` (your terminal's palette) |
+| `editor` | set when you choose one; any shell command, with the project folder added at the end |
+| `tickets` | ticket prefix → URL with `{key}`; `"*"` applies to every prefix |
+| `context_windows` | override the context size used for the context %, by model id fragment, e.g. `{"sonnet-4-5": 1000000}` (built in: 1M for current models, 200k for older ones) |
 
-The index is a SQLite file. Pins, notes and hidden flags live in their own
-table and survive re-indexing. If Claude Code's retention deletes a transcript,
-the session stays searchable but is marked *transcript deleted* and can't be
-resumed.
+If the file doesn't parse, ccrumbs says so and won't overwrite it.
+
+| Environment variable | Meaning |
+|---|---|
+| `CCRUMBS_HOME` | where the index and config live (default `~/.ccrumbs`) |
+| `CCRUMBS_EDITOR` | editor to use when none is chosen in the config |
+| `CCRUMBS_TIMING=1` | print how long each indexing phase takes |
+| `CLAUDE_CONFIG_DIR` | Claude Code's config folder (transcripts are in its `projects/`) |
+| `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL` | for `ccrumbs describe` |
+| `NO_COLOR` | plain output from the command-line commands |
+
+## Privacy
+
+ccrumbs reads Claude Code's transcripts and writes only to `~/.ccrumbs`
+(`index.db`, `config.json`, and `exports/` when you export from the picker).
+It sends no telemetry. Data leaves your machine only when you use one of
+these features:
+
+- **`describe` / `^d`:** sends a digest of the session (prompts, file names,
+  PR numbers, the end of the last reply) to the Anthropic API with your key.
+- **`sync` / `pr --sync`:** calls GitHub through your `gh` login, to read PR
+  metadata of repos found in your sessions.
+- **`open`, `^b`, `^k`:** open URLs in your browser.
+- **`mcp`:** answers the Claude Code session it's attached to; that session's
+  data handling applies to what Claude reads.
+
+## Performance
+
+ccrumbs is written in Rust and parses transcripts in parallel. Only files
+that changed are re-read, so it re-indexes on every launch. Measured on 4
+cores with a warm disk cache:
+
+| History | First index | Launch, nothing changed | Launch, a 14 MB session grew | Commands |
+|---|---|---|---|---|
+| 100 realistic sessions, 207 MB | 0.25 s | 1 ms | 40 ms | ~10 ms |
+| 2,000 synthetic sessions, 641 MB | 4.6 s | 9 ms | | |
 
 ## Limitations
 
-- The JSONL transcript format is internal to Claude Code. Parsing is
-  defensive, but a big format change may need a parser update.
-- Role detection is evidence-based, not authoritative. A PR you reviewed by
-  reading the diff in chat counts as *reviewed* only if you asked for a
-  review, or the session posted one.
-- Cloud-only sessions can't be resumed locally; `Ctrl-B` opens them on
-  claude.ai.
+- **The transcript format is internal to Claude Code** and changes between
+  releases. Parsing is defensive, but a big change may need an update here.
+- **PR roles are based on evidence, not authority.** A PR you reviewed only
+  by reading the diff in chat counts as *reviewed* if you asked for a review.
+- **claude.ai web sessions can't be resumed locally.** `ccrumbs open <id>
+  --cloud` opens them in the browser.
+- **Sessions deleted by Claude Code's cleanup** stay searchable (marked
+  *transcript deleted*), but can't be resumed or read in full.
 
-## Development
+## Contributing
 
-```bash
-cargo test
-cargo clippy
-cargo run --release -- list
-CCTRAIL_TIMING=1 cargo run --release -- index --full   # time per indexing phase
-```
+Bug reports and pull requests are welcome. See
+[CONTRIBUTING.md](CONTRIBUTING.md); for security issues, see
+[SECURITY.md](SECURITY.md).
+
+## License
+
+[MIT](LICENSE)

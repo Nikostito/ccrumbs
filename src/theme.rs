@@ -70,16 +70,6 @@ pub fn to_256((r, g, b): (u8, u8, u8)) -> u8 {
     (16 + 36 * level(r) + 6 * level(g) + level(b)) as u8
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn maps_to_256() {
-        assert_eq!(super::to_256((24, 24, 24)), 233);
-        assert_eq!(super::to_256((204, 204, 204)), 251);
-        assert_eq!(super::to_256((136, 180, 124)), 108);
-    }
-}
-
 /// Main background.
 pub fn bg() -> Color {
     pick((24, 24, 24), Color::Reset)
@@ -140,4 +130,14 @@ pub fn blue() -> Color {
 }
 pub fn teal() -> Color {
     pick((120, 170, 170), Color::Cyan)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn maps_to_256() {
+        assert_eq!(super::to_256((24, 24, 24)), 233);
+        assert_eq!(super::to_256((204, 204, 204)), 251);
+        assert_eq!(super::to_256((136, 180, 124)), 108);
+    }
 }

@@ -9,6 +9,43 @@ use std::collections::HashMap;
 /// `ai` and `prs` hold data that can't be re-derived locally and are kept.
 const SCHEMA_VERSION: i64 = 6;
 
+/// Every column of `sessions` beyond the key, so later versions can add columns to
+/// an existing database with ALTER TABLE instead of rebuilding it.
+const SESSION_COLUMNS: &[(&str, &str)] = &[
+    ("path", "TEXT"),
+    ("project_dir", "TEXT"),
+    ("cwd", "TEXT"),
+    ("branch", "TEXT"),
+    ("repo", "TEXT"),
+    ("started", "TEXT"),
+    ("ended", "TEXT"),
+    ("user_prompts", "INT"),
+    ("assistant_msgs", "INT"),
+    ("custom_title", "TEXT"),
+    ("summary", "TEXT"),
+    ("first_prompt", "TEXT"),
+    ("last_prompt", "TEXT"),
+    ("prompts_json", "TEXT"),
+    ("files_json", "TEXT"),
+    ("commands_run", "INT"),
+    ("tests_ran", "INT"),
+    ("commits", "INT"),
+    ("tokens_in", "INT"),
+    ("tokens_out", "INT"),
+    ("model", "TEXT"),
+    ("entrypoint", "TEXT"),
+    ("cloud_id", "TEXT"),
+    ("last_reply", "TEXT"),
+    ("auto_desc", "TEXT"),
+    ("mtime", "INT"),
+    ("size", "INT"),
+    ("missing", "INT DEFAULT 0"),
+    ("context_tokens", "INT DEFAULT 0"),
+    ("compactions", "INT DEFAULT 0"),
+    ("cost_usd", "REAL DEFAULT 0"),
+    ("tickets_json", "TEXT"),
+];
+
 pub struct Db {
     pub conn: Connection,
 }
@@ -30,7 +67,10 @@ impl Db {
         let v: i64 = self
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if v != SCHEMA_VERSION {
+        // Pre-release layouts (before 6) are rebuilt from the transcripts. From 6 on,
+        // new columns are added in place (see `ensure_columns`), so sessions whose
+        // transcripts Claude Code has since deleted are never lost to an upgrade.
+        if v != 0 && v < 6 {
             self.conn.execute_batch(
                 "DROP TABLE IF EXISTS sessions; DROP TABLE IF EXISTS session_prs; DROP TABLE IF EXISTS fts;",
             )?;
@@ -47,6 +87,9 @@ impl Db {
                 context_tokens INT DEFAULT 0, compactions INT DEFAULT 0, cost_usd REAL DEFAULT 0,
                 tickets_json TEXT
             );
+            -- Transcript files that hold no session (e.g. only a summary), so they
+            -- aren't parsed again on every run.
+            CREATE TABLE IF NOT EXISTS skipped (id TEXT PRIMARY KEY, mtime INT, size INT);
             -- Your own marks on sessions. Not derived from transcripts, so never dropped.
             CREATE TABLE IF NOT EXISTS marks (
                 id TEXT PRIMARY KEY, pinned INT DEFAULT 0, hidden INT DEFAULT 0, note TEXT
@@ -70,25 +113,110 @@ impl Db {
             CREATE INDEX IF NOT EXISTS prs_body_session ON prs(body_session);
             "#,
         )?;
+        self.ensure_columns()?;
         self.conn
-            .pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            .pragma_update(None, "user_version", v.max(SCHEMA_VERSION))?;
         Ok(())
     }
 
     /// `id -> (mtime, size)` for change detection.
     pub fn file_stamps(&self) -> Result<HashMap<String, (i64, i64)>> {
-        let mut st = self.conn.prepare("SELECT id, mtime, size FROM sessions")?;
+        let mut st = self.conn.prepare(
+            "SELECT id, mtime, size FROM sessions WHERE missing = 0 UNION ALL SELECT id, mtime, size FROM skipped",
+        )?;
         let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?))))?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     /// Empty the tables derived from transcripts in one go (used by `index --full`).
     /// Deleting full-text rows one by one is what made re-indexes slow.
-    pub fn clear_derived(&self) -> Result<()> {
-        self.conn.execute_batch(
-            "DELETE FROM sessions; DELETE FROM session_prs; DROP TABLE IF EXISTS fts;
-             CREATE VIRTUAL TABLE fts USING fts5(id UNINDEXED, title, body, tokenize='unicode61');",
+    pub fn clear_derived(&mut self) -> Result<()> {
+        // Keep sessions whose transcript is gone: they can't be re-read, and keeping
+        // history past Claude Code's retention is the point. Their search rows are
+        // copied aside because the full-text table is rebuilt from scratch.
+        let tx = self.conn.transaction()?;
+        tx.execute_batch(
+            "CREATE TEMP TABLE keep_fts AS SELECT f.rowid AS rid, f.id, f.title, f.body FROM fts f
+                 JOIN sessions s ON s.rowid = f.rowid WHERE s.missing = 1;
+             DELETE FROM session_prs WHERE session_id IN (SELECT id FROM sessions WHERE missing = 0);
+             DELETE FROM sessions WHERE missing = 0;
+             DELETE FROM skipped;
+             DROP TABLE IF EXISTS fts;
+             CREATE VIRTUAL TABLE fts USING fts5(id UNINDEXED, title, body, tokenize='unicode61');
+             INSERT INTO fts (rowid, id, title, body) SELECT rid, id, title, body FROM keep_fts;
+             DROP TABLE keep_fts;",
         )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Add columns a newer version expects to an existing table, keeping its rows.
+    fn ensure_columns(&self) -> Result<()> {
+        let have: std::collections::HashSet<String> = {
+            let mut st = self
+                .conn
+                .prepare("SELECT name FROM pragma_table_info('sessions')")?;
+            st.query_map([], |r| r.get(0))?
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        for (col, ty) in SESSION_COLUMNS {
+            if !have.contains(*col) {
+                self.conn
+                    .execute(&format!("ALTER TABLE sessions ADD COLUMN {col} {ty}"), [])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Forget sessions from projects that are now ignored.
+    pub fn drop_ignored(&mut self, cfg: &crate::config::Config) -> Result<usize> {
+        if cfg.ignored_projects.is_empty() {
+            return Ok(0);
+        }
+        let ids: Vec<String> = {
+            let mut st = self
+                .conn
+                .prepare("SELECT id, project_dir, COALESCE(cwd, '') FROM sessions")?;
+            let rows = st.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?;
+            rows.filter_map(|r| r.ok())
+                .filter(|(_, p, cwd)| {
+                    cfg.is_ignored(p)
+                        || cfg.is_ignored(&crate::text::decode_project_dir(p))
+                        || cfg.is_ignored(cwd)
+                })
+                .map(|(id, _, _)| id)
+                .collect()
+        };
+        let tx = self.conn.transaction()?;
+        for id in &ids {
+            tx.execute(
+                "DELETE FROM fts WHERE rowid = (SELECT rowid FROM sessions WHERE id = ?1)",
+                [id],
+            )?;
+            tx.execute("DELETE FROM session_prs WHERE session_id = ?1", [id])?;
+            tx.execute("DELETE FROM sessions WHERE id = ?1", [id])?;
+        }
+        tx.commit()?;
+        Ok(ids.len())
+    }
+
+    pub fn note_skipped(&mut self, stamps: &[(String, i64, i64)]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut st =
+                tx.prepare("INSERT OR REPLACE INTO skipped (id, mtime, size) VALUES (?1, ?2, ?3)")?;
+            for (id, m, z) in stamps {
+                st.execute(params![id, m, z])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -110,10 +238,12 @@ impl Db {
             let mut ins_p = tx.prepare(
                 "INSERT OR IGNORE INTO session_prs (session_id, repo, number, role, ts, evidence) VALUES (?1,?2,?3,?4,?5,?6)",
             )?;
+            let mut unskip = tx.prepare("DELETE FROM skipped WHERE id = ?1")?;
             let mut ins_f =
                 tx.prepare("INSERT INTO fts (rowid, id, title, body) VALUES (?1, ?2, ?3, ?4)")?;
             let mut tm = [std::time::Duration::ZERO; 4];
             for s in sessions {
+                unskip.execute([&s.id])?;
                 let t = std::time::Instant::now();
                 if let Some(rid) = old_rowid
                     .query_row([&s.id], |r| r.get::<_, i64>(0))
@@ -186,7 +316,7 @@ impl Db {
                 ins_f.execute(params![rowid, s.id, title, s.fulltext])?;
                 tm[3] += t.elapsed();
             }
-            if std::env::var_os("CCTRAIL_TIMING").is_some() {
+            if crate::config::env("TIMING").is_some() {
                 for (label, d) in ["delete old", "session rows", "PR links", "full-text"]
                     .iter()
                     .zip(tm)
@@ -199,22 +329,32 @@ impl Db {
         Ok(())
     }
 
-    pub fn mark_missing(&self, present: &std::collections::HashSet<String>) -> Result<usize> {
-        let ids: Vec<String> = {
-            let mut st = self
-                .conn
-                .prepare("SELECT id FROM sessions WHERE missing = 0")?;
-            st.query_map([], |r| r.get(0))?
-                .filter_map(|r| r.ok())
-                .collect()
+    /// Flag sessions whose transcript is no longer on disk, and clear the flag for
+    /// ones that are back (e.g. a project that was ignored and then un-ignored).
+    /// Returns how many are missing now.
+    pub fn mark_missing(&mut self, present: &std::collections::HashSet<String>) -> Result<usize> {
+        let rows: Vec<(String, bool)> = {
+            let mut st = self.conn.prepare("SELECT id, missing FROM sessions")?;
+            st.query_map([], |r| {
+                Ok((r.get(0)?, r.get::<_, Option<bool>>(1)?.unwrap_or(false)))
+            })?
+            .filter_map(|r| r.ok())
+            .collect()
         };
-        let mut n = 0;
-        for id in ids.iter().filter(|i| !present.contains(*i)) {
-            self.conn
-                .execute("UPDATE sessions SET missing = 1 WHERE id = ?1", [id])?;
-            n += 1;
+        let tx = self.conn.transaction()?;
+        let mut missing = 0;
+        for (id, was) in rows {
+            let now = !present.contains(&id);
+            if now != was {
+                tx.execute(
+                    "UPDATE sessions SET missing = ?2 WHERE id = ?1",
+                    params![id, now],
+                )?;
+            }
+            missing += now as usize;
         }
-        Ok(n)
+        tx.commit()?;
+        Ok(missing)
     }
 
     pub fn all_links(&self) -> Result<HashMap<String, Vec<PrLink>>> {
@@ -420,7 +560,7 @@ impl Db {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    /// Repos seen anywhere in the index (for `cctrail sync`).
+    /// Repos seen anywhere in the index (for `ccrumbs sync`).
     pub fn known_repos(&self) -> Result<Vec<String>> {
         let mut st = self.conn.prepare(
             "SELECT repo FROM session_prs WHERE repo != '' UNION SELECT repo FROM sessions WHERE repo IS NOT NULL AND repo != ''",

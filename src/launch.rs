@@ -10,7 +10,7 @@ pub fn resume_command(s: &SessionRow) -> String {
     format!(
         "cd {} && claude --resume {}",
         shell_quote(&s.resume_dir()),
-        s.id
+        shell_quote(&s.id)
     )
 }
 
@@ -34,7 +34,7 @@ pub fn resume_here(s: &SessionRow) -> Result<()> {
         );
     }
     eprintln!("→ {}", resume_command(s));
-    let mut cmd = Command::new("claude");
+    let mut cmd = program("claude");
     cmd.arg("--resume").arg(&s.id).current_dir(&dir);
     #[cfg(unix)]
     {
@@ -49,10 +49,44 @@ pub fn resume_here(s: &SessionRow) -> Result<()> {
     }
 }
 
+/// Where `bin` is on PATH. On Windows this also tries the PATHEXT extensions,
+/// since tools installed with npm (like `claude`) are `.cmd` files.
+fn find(bin: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    let exts: Vec<String> = if cfg!(windows) {
+        let pe = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+        std::iter::once(String::new())
+            .chain(pe.split(';').map(|e| e.to_lowercase()))
+            .collect()
+    } else {
+        vec![String::new()]
+    };
+    std::env::split_paths(&path)
+        .flat_map(|d| exts.iter().map(move |e| d.join(format!("{bin}{e}"))))
+        .find(|p| p.is_file())
+}
+
 fn which(bin: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
-        .unwrap_or(false)
+    find(bin).is_some()
+}
+
+/// A command for `bin`. On Windows, `.cmd`/`.bat` files have to go through cmd.exe.
+fn program(bin: &str) -> Command {
+    if cfg!(windows)
+        && let Some(p) = find(bin)
+    {
+        let ext = p
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if ext == "cmd" || ext == "bat" {
+            let mut c = Command::new("cmd");
+            c.arg("/c").arg(p);
+            return c;
+        }
+        return Command::new(p);
+    }
+    Command::new(bin)
 }
 
 /// Copy via OSC 52 (works over SSH in most terminals) and a native clipboard tool.
@@ -104,7 +138,7 @@ pub fn open_tab(s: &SessionRow) -> Result<String> {
     if !Path::new(&dir).is_dir() {
         bail!("directory {dir} no longer exists");
     }
-    let run = format!("claude --resume {}", s.id);
+    let run = format!("claude --resume {}", shell_quote(&s.id));
     let script = resume_command(s);
     let env = |k: &str| std::env::var_os(k).is_some();
     let term = std::env::var("TERM_PROGRAM").unwrap_or_default();
@@ -119,7 +153,10 @@ pub fn open_tab(s: &SessionRow) -> Result<String> {
 
     // Multiplexers first: a tab there is what you'd expect even inside any terminal app.
     if env("TMUX") {
-        ok(Command::new("tmux").args(["new-window", "-c", &dir, &run]))?;
+        // Arguments after the options are run directly, without tmux's shell parsing;
+        // the shell keeps the window open after claude exits, like the other terminals.
+        let keep = format!("{run}; exec \"${{SHELL:-sh}}\"");
+        ok(Command::new("tmux").args(["new-window", "-c", &dir, "sh", "-c", &keep]))?;
         return Ok("opened a new tmux window".into());
     }
     if env("ZELLIJ") {
@@ -168,9 +205,18 @@ pub fn open_tab(s: &SessionRow) -> Result<String> {
             "Apple_Terminal" => format!(
                 "tell application \"Terminal\" to activate\ntell application \"System Events\" to keystroke \"t\" using command down\ndelay 0.3\ntell application \"Terminal\" to do script \"{esc}\" in selected tab of front window"
             ),
-            // Ghostty, Warp, Hyper, Tabby, ...: ⌘T opens a tab, then type the command.
-            _ => format!(
+            // Ghostty, Warp, Hyper, Tabby: ⌘T opens a tab, then type the command. Only for
+            // these, and never over SSH: the keystrokes go to whatever app is in front.
+            "ghostty" | "WarpTerminal" | "Hyper" | "Tabby" if !env("SSH_CONNECTION") => format!(
                 "tell application \"System Events\"\nkeystroke \"t\" using command down\ndelay 0.4\nkeystroke \"{esc}\"\nkey code 36\nend tell"
+            ),
+            _ => bail!(
+                "can't open a tab in this terminal{}; use ^y to copy the command",
+                if term.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({term})")
+                }
             ),
         };
         let out = Command::new("osascript").args(["-e", &osa]).output()?;
@@ -201,19 +247,16 @@ pub fn open_tab(s: &SessionRow) -> Result<String> {
     if cfg!(windows) {
         if which("wt.exe") || which("wt") {
             // `-w 0` targets the current Windows Terminal window, so this is a tab, not a window.
-            Command::new("wt")
-                .args(["-w", "0", "nt", "-d", &dir, "cmd", "/k", &run])
+            program("wt")
+                .args([
+                    "-w", "0", "nt", "-d", &dir, "cmd", "/k", "claude", "--resume", &s.id,
+                ])
                 .spawn()?;
             return Ok("opened a new Windows Terminal tab".into());
         }
         Command::new("cmd")
-            .args([
-                "/c",
-                "start",
-                "cmd",
-                "/k",
-                &format!("cd /d \"{dir}\" && {run}"),
-            ])
+            .args(["/c", "start", "cmd", "/k", "claude", "--resume", &s.id])
+            .current_dir(&dir)
             .spawn()?;
         return Ok("opened a new cmd window (Windows Terminal not found)".into());
     }
@@ -229,8 +272,8 @@ pub fn open_tab(s: &SessionRow) -> Result<String> {
                 .is_ok())
         .then(|| format!("opened a new {bin} tab"))
     };
-    if env("GNOME_TERMINAL_SCREEN") || env("GNOME_TERMINAL_SERVICE") {
-        if let Some(m) = tab_in(
+    if (env("GNOME_TERMINAL_SCREEN") || env("GNOME_TERMINAL_SERVICE"))
+        && let Some(m) = tab_in(
             "gnome-terminal",
             vec![
                 "--tab",
@@ -241,12 +284,12 @@ pub fn open_tab(s: &SessionRow) -> Result<String> {
                 "-c",
                 &keep_shell,
             ],
-        ) {
-            return Ok(m);
-        }
+        )
+    {
+        return Ok(m);
     }
-    if env("KONSOLE_VERSION") {
-        if let Some(m) = tab_in(
+    if env("KONSOLE_VERSION")
+        && let Some(m) = tab_in(
             "konsole",
             vec![
                 "--new-tab",
@@ -257,12 +300,12 @@ pub fn open_tab(s: &SessionRow) -> Result<String> {
                 "-c",
                 &keep_shell,
             ],
-        ) {
-            return Ok(m);
-        }
+        )
+    {
+        return Ok(m);
     }
-    if term == "xfce4-terminal" || env("XFCE_TERMINAL") {
-        if let Some(m) = tab_in(
+    if (term == "xfce4-terminal" || env("XFCE_TERMINAL"))
+        && let Some(m) = tab_in(
             "xfce4-terminal",
             vec![
                 "--tab",
@@ -273,16 +316,16 @@ pub fn open_tab(s: &SessionRow) -> Result<String> {
                 "-c",
                 &keep_shell,
             ],
-        ) {
-            return Ok(m);
-        }
+        )
+    {
+        return Ok(m);
     }
     bail!(
         "this terminal has no way to open a tab from outside; use ^y to copy the command (tabs work in tmux, zellij, WezTerm, kitty, iTerm2, Terminal, Ghostty, Warp, GNOME Terminal, Konsole, Windows Terminal)"
     )
 }
 
-/// An editor cctrail can open a project in.
+/// An editor ccrumbs can open a project in.
 #[derive(Debug, Clone)]
 pub struct Editor {
     pub label: String,
@@ -292,18 +335,45 @@ pub struct Editor {
     pub gui: bool,
 }
 
-const TERMINAL_EDITORS: &[&str] = &[
-    "nvim", "vim", "vi", "hx", "helix", "emacs", "nano", "micro", "kak",
+/// Editors that open their own window. Anything else is run in the terminal (the
+/// picker steps aside until it exits), which is the safe default for `$EDITOR`.
+const GUI_EDITORS: &[&str] = &[
+    "code",
+    "code-insiders",
+    "cursor",
+    "codium",
+    "windsurf",
+    "zed",
+    "subl",
+    "idea",
+    "pycharm",
+    "webstorm",
+    "goland",
+    "rustrover",
+    "clion",
+    "phpstorm",
+    "rider",
+    "fleet",
+    "mate",
+    "bbedit",
+    "nova",
+    "gedit",
+    "kate",
+    "notepad",
+    "notepad++",
+    "open",
+    "xdg-open",
 ];
 
 fn is_gui(command: &str) -> bool {
     let first = command.split_whitespace().next().unwrap_or("");
-    let name = Path::new(first)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
-    // `emacs -nw` is the terminal flavour; plain `emacs` opens a window when it can, but treat as terminal.
-    !TERMINAL_EDITORS.contains(&name.as_str())
+    let name = crate::text::file_name(first).to_lowercase();
+    let name = name
+        .strip_suffix(".exe")
+        .or_else(|| name.strip_suffix(".cmd"))
+        .unwrap_or(&name)
+        .to_string();
+    GUI_EDITORS.contains(&name.as_str())
 }
 
 /// Editors found on this machine, most common first.
@@ -378,10 +448,10 @@ pub fn detect_editors() -> Vec<Editor> {
         }
     }
     for var in ["VISUAL", "EDITOR"] {
-        if let Ok(v) = std::env::var(var) {
-            if !v.trim().is_empty() {
-                add(&format!("${var} ({v})"), v);
-            }
+        if let Ok(v) = std::env::var(var)
+            && !v.trim().is_empty()
+        {
+            add(&format!("${var} ({v})"), v);
         }
     }
     out
@@ -404,12 +474,12 @@ pub fn resolve_editor(input: &str) -> String {
         .unwrap_or_else(|| i.to_string())
 }
 
-/// The editor to use: the one you chose (`editor` in the config), else `$CCTRAIL_EDITOR`.
+/// The editor to use: the one you chose (`editor` in the config), else `$CCRUMBS_EDITOR`.
 /// None means "ask".
 pub fn chosen_editor(cfg_editor: Option<&str>) -> Option<String> {
     cfg_editor
         .map(str::to_string)
-        .or_else(|| std::env::var("CCTRAIL_EDITOR").ok())
+        .or_else(|| crate::config::env("EDITOR"))
         .filter(|s| !s.trim().is_empty())
 }
 
@@ -428,9 +498,15 @@ pub fn editor_command(editor: &str, dir: &str) -> Result<(Command, bool)> {
             .arg(dir);
         c
     } else {
-        let mut parts = editor.split_whitespace();
-        let mut c = Command::new(parts.next().unwrap_or("notepad"));
-        c.args(parts).arg(dir);
+        // cmd.exe parses the editor string (quotes, `C:\Program Files\…`, `.cmd` shims).
+        let mut c = Command::new("cmd");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            c.raw_arg(format!("/c {editor} \"{dir}\""));
+        }
+        #[cfg(not(windows))]
+        c.args(["/c", editor, dir]);
         c
     };
     cmd.current_dir(dir);
@@ -441,7 +517,8 @@ pub fn open_url(url: &str) -> Result<()> {
     let (bin, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {
         ("open", vec![url])
     } else if cfg!(windows) {
-        ("cmd", vec!["/c", "start", "", url])
+        // Not `cmd /c start`: cmd would split the URL at `&`.
+        ("rundll32", vec!["url.dll,FileProtocolHandler", url])
     } else {
         ("xdg-open", vec![url])
     };

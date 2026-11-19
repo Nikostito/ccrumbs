@@ -1,16 +1,24 @@
 [package]
-name = "cctrail"
+name = "ccrumbs"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89"
 description = "Find, understand and resume your Claude Code sessions, and see which PRs they created or reviewed"
+authors = ["Nikos"]
 license = "MIT"
 readme = "README.md"
-rust-version = "1.85"
+repository = "https://github.com/nikostito/ccrumbs"
+homepage = "https://github.com/nikostito/ccrumbs"
+keywords = ["claude-code", "claude", "sessions", "tui", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+# Screenshots and CI config aren't needed to build; README images use absolute URLs.
+exclude = ["docs/", ".github/", "target/"]
 
 [dependencies]
 anyhow = "1.0.104"
 chrono = "0.4.45"
 clap = { version = "4.6.8", features = ["derive"] }
+clap_complete = "4"
 dirs = "7.0.0"
 nucleo-matcher = "0.3.1"
 ratatui = "0.30.2"
@@ -19,6 +27,7 @@ regex = "1.13.2"
 rusqlite = { version = "0.43.0", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+unicode-width = "0.2"
 ureq = { version = "3.5.2", features = ["json", "platform-verifier"] }
 
 [target."cfg(unix)".dependencies]

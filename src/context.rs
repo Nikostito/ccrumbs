@@ -1,4 +1,4 @@
-//! Where you are right now: the directory, git repo and branch cctrail was started in.
+//! Where you are right now: the directory, git repo and branch ccrumbs was started in.
 //! Sessions from here are ranked first.
 
 use crate::model::SessionRow;
@@ -64,8 +64,10 @@ impl Context {
             (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
             _ => false,
         };
-        let dir = s.resume_dir();
-        let under_root = dir == self.root || dir.starts_with(&format!("{}/", self.root));
+        // Compare normalised paths: git prints `C:/x/proj`, transcripts record `C:\x\proj`.
+        let dir = crate::text::norm_path(&s.resume_dir());
+        let root = crate::text::norm_path(&self.root);
+        let under_root = dir == root || dir.starts_with(&format!("{root}/"));
         if !(same_repo || under_root) {
             return TIER_NONE;
         }
@@ -77,7 +79,7 @@ impl Context {
 
     /// Short label for the header, e.g. `api · feat/rate-limit`.
     pub fn label(&self) -> String {
-        let name = self.root.rsplit('/').next().unwrap_or(&self.root);
+        let name = crate::text::file_name(&self.root);
         match &self.branch {
             Some(b) => format!("{name} · {b}"),
             None => name.to_string(),

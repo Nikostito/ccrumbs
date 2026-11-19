@@ -1,4 +1,4 @@
-//! Query parsing, filters and ranking shared by the picker and `cctrail go`.
+//! Query parsing, filters and ranking shared by the picker and `ccrumbs go`.
 //!
 //! Query syntax (all parts optional, combined with AND):
 //! - free words: fuzzy on title/project/branch/PR numbers, then substring on description & prompts
@@ -55,15 +55,16 @@ fn parse_age(spec: &str) -> Option<(DateTime<Utc>, Option<DateTime<Utc>>)> {
         "month" => (now - Duration::days(30), None),
         _ => {
             let (n, unit) = spec.split_at(spec.find(|c: char| !c.is_ascii_digit())?);
+            // Checked arithmetic: `@99999999d` must not panic.
             let n: i64 = n.parse().ok()?;
             let d = match unit {
-                "h" => Duration::hours(n),
-                "d" => Duration::days(n),
-                "w" => Duration::weeks(n),
-                "m" | "mo" => Duration::days(30 * n),
+                "h" => Duration::try_hours(n)?,
+                "d" => Duration::try_days(n)?,
+                "w" => Duration::try_weeks(n)?,
+                "m" | "mo" => Duration::try_days(n.checked_mul(30)?)?,
                 _ => return None,
             };
-            (now - d, None)
+            (now.checked_sub_signed(d)?, None)
         }
     })
 }
@@ -180,6 +181,9 @@ pub fn is_quick(s: &SessionRow) -> bool {
 /// Per-session data precomputed once per load.
 pub struct Corpus {
     pub hay: Vec<String>,
+    /// `hay`, lowercased, for plain substring matches the fuzzy scorer rates low
+    /// (a word in the middle of a branch or project name).
+    pub hay_lower: Vec<String>,
     pub bodies: Vec<String>,
     /// Closeness to the current context (see `context::TIER_*`).
     pub tier: Vec<u8>,
@@ -192,8 +196,10 @@ impl Corpus {
         ctx: Option<&Context>,
         task_of: Vec<Option<usize>>,
     ) -> Corpus {
+        let hay: Vec<String> = sessions.iter().map(haystack).collect();
         Corpus {
-            hay: sessions.iter().map(haystack).collect(),
+            hay_lower: hay.iter().map(|h| h.to_lowercase()).collect(),
+            hay,
             bodies: sessions.iter().map(body).collect(),
             tier: sessions
                 .iter()
@@ -283,10 +289,10 @@ pub fn passes(s: &SessionRow, task: Option<usize>, q: &Query) -> bool {
         .as_deref()
         .or(s.started.as_deref())
         .and_then(crate::text::parse_ts);
-    if let Some(since) = q.since {
-        if last.is_none_or(|t| t < since) {
-            return false;
-        }
+    if let Some(since) = q.since
+        && last.is_none_or(|t| t < since)
+    {
+        return false;
     }
     if let Some(until) = q.until {
         let first = s.started.as_deref().and_then(crate::text::parse_ts);
@@ -344,7 +350,13 @@ impl Ranker {
                 .filter(|&sc| sc >= min_fuzzy);
             let score = match fuzzy {
                 Some(sc) => sc + 1000,
-                None if words.iter().all(|w| c.bodies[i].contains(w.as_str())) => 500,
+                None if words.iter().all(|w| c.hay_lower[i].contains(w.as_str())) => 900,
+                None if words.iter().all(|w| {
+                    c.bodies[i].contains(w.as_str()) || c.hay_lower[i].contains(w.as_str())
+                }) =>
+                {
+                    500
+                }
                 None => continue,
             };
             // Gentle boosts: newer wins among similar matches, and so do sessions from here.
@@ -433,6 +445,30 @@ mod tests {
     }
 
     #[test]
+    fn mid_word_matches() {
+        let mut s = sess(
+            "aaaa1111",
+            "/code/billingservice",
+            "feat/ratelimit",
+            &[],
+            2,
+            1,
+        );
+        s.first_prompt = Some("tweak".into());
+        let sessions = vec![s];
+        let corpus = Corpus::new(&sessions, None, vec![None]);
+        for q in ["limit", "service", "servic", "ratelimit"] {
+            assert_eq!(
+                Ranker::default()
+                    .rank(&sessions, &corpus, &parse(q), Opts::default())
+                    .len(),
+                1,
+                "{q}"
+            );
+        }
+    }
+
+    #[test]
     fn filters_and_context() {
         let mut a = sess(
             "aaaa1111",
@@ -495,5 +531,7 @@ mod tests {
         // Scattered letters don't count as a fuzzy match; substring in the description does.
         assert_eq!(all("ratelimit", Opts::default()), ["aaaa"]);
         assert!(all("zqxj", Opts::default()).is_empty());
+        assert!(parse("@99999999d").since.is_none());
+        assert!(parse("@9999999999999w").since.is_none());
     }
 }

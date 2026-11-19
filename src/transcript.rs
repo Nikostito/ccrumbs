@@ -64,6 +64,15 @@ fn result_text(b: &Value) -> String {
 
 /// Load the main thread of a transcript (subagent side-chains are skipped).
 pub fn load(path: &str) -> Vec<Entry> {
+    let mut entries = load_raw(path);
+    // Transcript text is printed to terminals: drop escape sequences it may contain.
+    for e in &mut entries {
+        e.text = text::strip_controls(&e.text);
+    }
+    entries
+}
+
+fn load_raw(path: &str) -> Vec<Entry> {
     let Ok(data) = std::fs::read_to_string(path) else {
         return vec![];
     };
@@ -183,7 +192,7 @@ fn clock(ts: Option<&str>) -> String {
         .unwrap_or_default()
 }
 
-/// Plain-text rendering (for `cctrail view` and the MCP server).
+/// Plain-text rendering (for `ccrumbs view` and the MCP server).
 pub fn to_text(entries: &[Entry], outputs: bool) -> String {
     let mut b = String::new();
     for e in entries {
