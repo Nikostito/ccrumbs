@@ -189,12 +189,12 @@ pub fn to_text(entries: &[Entry], outputs: bool) -> String {
     for e in entries {
         match e.kind {
             Kind::User => b.push_str(&format!(
-                "\n▶ YOU  {}\n{}\n",
+                "\n► YOU  {}\n{}\n",
                 clock(e.ts.as_deref()),
                 e.text
             )),
-            Kind::Assistant => b.push_str(&format!("\n◀ CLAUDE\n{}\n", e.text)),
-            Kind::Tool => b.push_str(&format!("  ⚙ {}\n", text::truncate(&e.text, 160))),
+            Kind::Assistant => b.push_str(&format!("\n◄ CLAUDE\n{}\n", e.text)),
+            Kind::Tool => b.push_str(&format!("  › {}\n", text::truncate(&e.text, 160))),
             Kind::Output | Kind::Error if outputs => {
                 for l in e.text.lines().take(8) {
                     b.push_str(&format!("    │ {l}\n"));

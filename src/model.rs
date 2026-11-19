@@ -57,10 +57,10 @@ impl Role {
     pub fn icon(self) -> &'static str {
         match self {
             Role::Created => "●",
-            Role::Reviewed => "◆",
-            Role::Merged => "✔",
-            Role::Commented => "✎",
-            Role::WorkedOn => "↻",
+            Role::Reviewed => "♦",
+            Role::Merged => "√",
+            Role::Commented => "»",
+            Role::WorkedOn => "►",
             Role::Viewed => "·",
             Role::Mentioned => "·",
         }
