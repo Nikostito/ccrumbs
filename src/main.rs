@@ -16,6 +16,7 @@ mod prview;
 mod search;
 mod tasks;
 mod text;
+mod theme;
 mod tickets;
 mod transcript;
 mod tui;
@@ -103,6 +104,15 @@ enum Cmd {
     },
     Unhide {
         id: String,
+    },
+    /// Open a session's project in your editor (see `cctrail editor`).
+    Edit {
+        id: String,
+    },
+    /// Which editor projects open in. No arguments: show it and the editors found.
+    Editor {
+        #[command(subcommand)]
+        cmd: Option<EditorCmd>,
     },
     /// Print a session's directory: `cd "$(cctrail dir a1b2)"`.
     Dir {
@@ -210,6 +220,12 @@ enum Cmd {
         #[arg(long)]
         full: bool,
     },
+    /// Links for Jira / Linear tickets. With no arguments: what's set, and which
+    /// ticket prefixes appear in your sessions.
+    Tickets {
+        #[command(subcommand)]
+        cmd: Option<TicketsCmd>,
+    },
     /// Show configuration and paths.
     Config,
     /// Never index projects whose path contains this.
@@ -220,6 +236,28 @@ enum Cmd {
     Unignore {
         pattern: String,
     },
+}
+
+#[derive(Subcommand)]
+enum EditorCmd {
+    /// `cctrail editor set cursor`, `set pycharm`, or any command: `set "code -n"`.
+    Set { editor: Vec<String> },
+    /// Forget the choice; cctrail asks again next time.
+    Reset,
+}
+
+#[derive(Subcommand)]
+enum TicketsCmd {
+    /// `cctrail tickets set ABC https://acme.atlassian.net` (any ticket URL works too).
+    /// With only a URL, it's used for every prefix.
+    Set {
+        /// Ticket prefix (ABC for ABC-123), or the URL to use for all prefixes.
+        prefix_or_url: String,
+        /// Your Jira / Linear address, or a link to any ticket.
+        url: Option<String>,
+    },
+    /// Forget the link for a prefix (`*` for the catch-all).
+    Remove { prefix: String },
 }
 
 struct Paint(bool);
@@ -389,6 +427,25 @@ fn real_main() -> Result<()> {
         Cmd::Dir { id } => {
             let sessions = db.load_sessions()?;
             println!("{}", one(&sessions, &id)?.resume_dir());
+            Ok(())
+        }
+        Cmd::Tickets { cmd } => tickets_cmd(&p, &db, cmd),
+        Cmd::Editor { cmd } => editor_cmd(&p, cmd),
+        Cmd::Edit { id } => {
+            let sessions = db.load_sessions()?;
+            let s = one(&sessions, &id)?;
+            let Some(ed) = launch::chosen_editor(cfg.editor.as_deref()) else {
+                bail!(
+                    "no editor chosen yet: run `cctrail editor` to see what's installed, then `cctrail editor set <name>`"
+                );
+            };
+            let (mut cmd, gui) = launch::editor_command(&ed, &s.resume_dir())?;
+            if gui {
+                cmd.spawn()?;
+                eprintln!("Opened {} with {ed}", home_short(&s.resume_dir()));
+            } else {
+                cmd.status()?;
+            }
             Ok(())
         }
         Cmd::ShellInit { .. } | Cmd::Mcp => unreachable!(),
@@ -590,6 +647,131 @@ fn pick_mode(db: &mut Db, cfg: &Config, query: &str, mode: PickMode) -> Result<(
     }
 }
 
+fn editor_cmd(p: &Paint, cmd: Option<EditorCmd>) -> Result<()> {
+    match cmd {
+        Some(EditorCmd::Set { editor }) => {
+            let wanted = editor.join(" ");
+            if wanted.trim().is_empty() {
+                bail!("say which editor, e.g. `cctrail editor set cursor`");
+            }
+            let command = launch::resolve_editor(&wanted);
+            config::set_editor(Some(&command))?;
+            println!("Projects now open with: {command}");
+        }
+        Some(EditorCmd::Reset) => {
+            config::set_editor(None)?;
+            println!("Forgot the editor; Ctrl-E in the picker will ask again.");
+        }
+        None => {
+            let current = launch::chosen_editor(Config::load().editor.as_deref());
+            match &current {
+                Some(c) => println!("Projects open with: {}", p.bold(c)),
+                None => println!(
+                    "No editor chosen yet: Ctrl-E in the picker asks, or use `cctrail editor set <name>`."
+                ),
+            }
+            let found = launch::detect_editors();
+            if !found.is_empty() {
+                println!();
+                println!("{}", p.bold("Editors found"));
+                for e in found {
+                    let kind = if e.gui { "app" } else { "in terminal" };
+                    let mark = if current.as_deref() == Some(e.command.as_str()) {
+                        p.c("32", " (current)")
+                    } else {
+                        String::new()
+                    };
+                    println!("  {:<18} {:<34} {}{mark}", e.label, e.command, p.dim(kind));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn tickets_cmd(p: &Paint, db: &Db, cmd: Option<TicketsCmd>) -> Result<()> {
+    match cmd {
+        Some(TicketsCmd::Set { prefix_or_url, url }) => {
+            let (prefix, url) = match url {
+                Some(u) => (prefix_or_url.trim().to_uppercase(), u),
+                None => ("*".to_string(), prefix_or_url),
+            };
+            let prefix = if prefix == "ANY" || prefix == "ALL" {
+                "*".to_string()
+            } else {
+                prefix
+            };
+            let tpl = config::ticket_template(&url)?;
+            config::set_ticket_url(&prefix, &tpl)?;
+            let example = if prefix == "*" {
+                "ABC-123".to_string()
+            } else {
+                format!("{prefix}-123")
+            };
+            println!(
+                "Saved: {} → {}",
+                if prefix == "*" {
+                    "all tickets"
+                } else {
+                    prefix.as_str()
+                },
+                tpl
+            );
+            println!(
+                "{}",
+                p.dim(format!(
+                    "e.g. {example} opens {}",
+                    tpl.replace("{key}", &example)
+                ))
+            );
+        }
+        Some(TicketsCmd::Remove { prefix }) => {
+            let prefix = prefix.trim().to_uppercase();
+            if config::remove_ticket_url(&prefix)? {
+                println!("Removed the link for {prefix}");
+            } else {
+                println!("No link was set for {prefix}");
+            }
+        }
+        None => {
+            let links = config::ticket_templates();
+            if links.is_empty() {
+                println!("No ticket links yet. Set one with:");
+                println!("  cctrail tickets set ABC https://yourcompany.atlassian.net");
+                println!("  cctrail tickets set ENG https://linear.app/yourteam");
+            } else {
+                println!("{}", p.bold("Ticket links"));
+                for (k, v) in &links {
+                    println!("  {:<6} {v}", if k == "*" { "(all)" } else { k.as_str() });
+                }
+            }
+            let mut seen: std::collections::BTreeMap<String, usize> = Default::default();
+            for s in db.load_sessions()? {
+                for t in &s.tickets {
+                    *seen.entry(tickets::prefix(t).to_string()).or_default() += 1;
+                }
+            }
+            if !seen.is_empty() {
+                println!();
+                println!("{}", p.bold("Ticket prefixes in your sessions"));
+                for (k, n) in seen {
+                    let linked = links.contains_key(&k) || links.contains_key("*");
+                    let status = if linked {
+                        p.c("32", "linked")
+                    } else {
+                        p.c("33", format!("no link: cctrail tickets set {k} <url>"))
+                    };
+                    println!(
+                        "  {k:<6} {n:>3} session{}  {status}",
+                        if n == 1 { " " } else { "s" }
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn shell_init(shell: &str) -> String {
     match shell {
         "fish" => {
@@ -636,9 +818,8 @@ fn open_cmd(db: &Db, target: &str, pr: bool, ticket: bool, cloud: bool, print: b
     let ticket_url = |k: &str| {
         config::ticket_url(k).ok_or_else(|| {
             anyhow::anyhow!(
-                "no URL configured for {k}: add \"tickets\": {{\"{}\": \"https://…/browse/{{key}}\"}} to {}",
-                tickets::prefix(k),
-                config::config_path().display()
+                "no link set for {k} tickets yet: cctrail tickets set {} <your Jira or Linear URL>",
+                tickets::prefix(k)
             )
         })
     };
@@ -827,14 +1008,14 @@ fn print_row(p: &Paint, s: &SessionRow, long: bool) {
         None => "    ".to_string(),
     };
     let mark = match (s.pinned, s.note.is_some()) {
-        (true, _) => p.c("33", "★ "),
-        (false, true) => p.c("33", "✎ "),
+        (true, _) => p.c("33", "↑ "),
+        (false, true) => p.c("33", "≡ "),
         _ => String::new(),
     };
     let tickets: String = s
         .tickets
         .iter()
-        .map(|t| format!(" {}", p.c("36", format!("⚑{t}"))))
+        .map(|t| format!(" {}", p.c("36", t)))
         .collect();
     println!(
         "{}  {:>4}  {}  {:<18}  {mark}{}{}{tickets}",
@@ -871,7 +1052,7 @@ fn show(p: &Paint, s: &SessionRow, sessions: &[SessionRow], prs: &[PrEntry]) {
         p.dim(
             s.branch
                 .as_ref()
-                .map(|b| format!("⎇ {b}"))
+                .map(|b| format!("branch {b}"))
                 .unwrap_or_default()
         )
     );
@@ -913,17 +1094,17 @@ fn show(p: &Paint, s: &SessionRow, sessions: &[SessionRow], prs: &[PrEntry]) {
         println!("{}", p.dim(c));
     }
     if let Some(n) = &s.note {
-        println!("{}", p.c("33", format!("✎ {n}")));
+        println!("{}", p.c("33", format!("note: {n}")));
     }
     if s.pinned {
-        println!("{}", p.c("33", "★ pinned"));
+        println!("{}", p.c("33", "pinned"));
     }
     for t in &s.tickets {
         println!(
             "{}",
             p.c(
                 "36",
-                format!("⚑ {t}  {}", config::ticket_url(t).unwrap_or_default())
+                format!("ticket {t}  {}", config::ticket_url(t).unwrap_or_default())
             )
         );
     }
@@ -990,7 +1171,7 @@ fn show(p: &Paint, s: &SessionRow, sessions: &[SessionRow], prs: &[PrEntry]) {
                         .filter(|a| me.is_none_or(|m| **a != Actor::Local(m)))
                     {
                         println!(
-                            "      ↳ {} in another session: {}",
+                            "      └ {} in another session: {}",
                             p.role(role, role.as_str()),
                             actor(p, sessions, a)
                         );
@@ -1025,7 +1206,7 @@ fn print_task(p: &Paint, t: &tasks::Task, sessions: &[SessionRow], prs: &[PrEntr
     let branch = t
         .branch
         .as_ref()
-        .map(|b| format!(" ⎇ {b}"))
+        .map(|b| format!(" · {b}"))
         .unwrap_or_default();
     let extra = format!(
         "{}{}",

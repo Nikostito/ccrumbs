@@ -75,11 +75,11 @@ impl Context {
         }
     }
 
-    /// Short label for the header, e.g. `api ⎇ feat/rate-limit`.
+    /// Short label for the header, e.g. `api · feat/rate-limit`.
     pub fn label(&self) -> String {
         let name = self.root.rsplit('/').next().unwrap_or(&self.root);
         match &self.branch {
-            Some(b) => format!("{name} ⎇ {b}"),
+            Some(b) => format!("{name} · {b}"),
             None => name.to_string(),
         }
     }

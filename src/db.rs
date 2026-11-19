@@ -301,6 +301,7 @@ impl Db {
         // Prefixes trusted for keys that only appear in prompts: configured ones, and
         // any prefix seen in some session's branch name.
         let templates = crate::config::ticket_templates();
+        let templates = &templates;
         let any_prefix = templates.contains_key("*");
         let mut trusted: std::collections::HashSet<String> =
             templates.keys().filter(|k| *k != "*").cloned().collect();

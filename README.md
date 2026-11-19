@@ -8,7 +8,7 @@ Find a Claude Code session in seconds, see what it did and which PRs it
 Type a few words (or `#123` for a PR), press **Enter**, and you're back in
 that session: cctrail `cd`s into its directory and runs
 `claude --resume <id>` for you. Started inside a repo, it puts that repo's
-sessions first (◉ same branch, ○ same repo). Inside a repo, plain
+sessions first (● same branch, ○ same repo). Inside a repo, plain
 `cctrail go` continues the latest session on your branch.
 
 ## What it gives you
@@ -34,7 +34,7 @@ sessions first (◉ same branch, ○ same repo). Inside a repo, plain
   outside your Claude sessions"*. A session's detail view also says
   *"↳ created in another session: …"* next to PRs it only reviewed.
 - **Context fill and cost per session.** Each session shows how full its
-  context window was when it ended (◔ green under 50%, yellow under 80%, red
+  context window was when it ended (green under 50%, yellow under 80%, red
   above), how many times it was compacted, and what it cost, taken from
   Claude Code's own cost tally. A session at 87% is close to compacting
   again, so it's often better to start fresh than to resume it.
@@ -64,8 +64,18 @@ sessions first (◉ same branch, ○ same repo). Inside a repo, plain
 
 - **Jira and Linear tickets.** Keys like `ABC-123` are picked up from branch
   names (`feature/ABC-123-…`, `nikos/eng-42-…`), prompts and titles. They
-  show as ⚑ badges, are searchable (type `ABC-123`), group sessions into
-  one task, and `Ctrl-K` opens the ticket.
+  show next to the session, are searchable (type `ABC-123`), group sessions
+  into one task, and `Ctrl-K` opens the ticket. The first time, cctrail asks
+  for your Jira or Linear address (paste any ticket link) and remembers it;
+  or set it with `cctrail tickets set ABC https://yourcompany.atlassian.net`.
+- **Opens in your editor.** `Ctrl-E` opens the session's project in the
+  editor you picked. The first time, it lists the editors it finds (VS Code,
+  Cursor, Zed, JetBrains IDEs, Neovim and others, including macOS apps
+  without a command-line launcher) and remembers your choice. Change it with
+  `Ctrl-A i` or `cctrail editor set <name>`.
+
+  ![Choosing an editor](docs/editor.png)
+
 - **Pins, notes and cleanup.** `Ctrl-S` pins the sessions you're juggling to
   the top. Notes (`Ctrl-A n`) show in the preview and are searchable.
   Sessions you'll never need again can be hidden (`Ctrl-A h`).
@@ -115,6 +125,9 @@ Or, from a clone, run `cargo install --path . --locked`. That puts a single
 | `cctrail export <id> [-o file.md \| -o -]` | Summary, PRs, tickets, files and conversation as Markdown |
 | `cctrail open <id \| #PR \| ABC-123> [--pr\|--ticket\|--cloud] [--print]` | Open the session's PR, ticket or claude.ai page |
 | `cctrail pin <id>` / `unpin` · `note <id> [text]` · `hide <id>` / `unhide` | Your own marks; `note <id>` with no text clears it |
+| `cctrail edit <id>` | Open the session's project in your editor |
+| `cctrail editor [set <name> \| reset]` | Show / choose the editor (`set cursor`, `set pycharm`, `set "code -n"`) |
+| `cctrail tickets [set <PREFIX> <url> \| remove <PREFIX>]` | Show / set Jira and Linear links; the URL can be your site or any ticket link |
 | `cctrail dir <id>` | Print the session's directory: `cd "$(cctrail dir a1b2)"` |
 | `cctrail pick --print-dir` / `--print` | Pick interactively, print the directory / resume command |
 | `cctrail shell-init zsh\|bash\|fish` | Key binding and `ccd` helper (see below) |
@@ -151,10 +164,10 @@ Plain words match titles, projects, branches, descriptions and prompts:
 | `Ctrl-T` | hide / show one-off quick sessions (1 prompt, no edits, no PRs) |
 | `Ctrl-A` | actions menu for the selection (everything below, plus export, note, hide, copy id) |
 | `Ctrl-V` | read the conversation (`/` find, `n`/`N` next/prev, `o` tool output, Enter resume, Esc back) |
-| `Ctrl-K` | open the Jira / Linear ticket |
+| `Ctrl-K` | open the Jira / Linear ticket (asks for the link the first time) |
 | `Ctrl-S` | pin / unpin |
-| `Ctrl-E` | open the project in your editor (`$CCTRAIL_EDITOR`, `$VISUAL`, `$EDITOR`, else VS Code / Cursor / Zed) |
-| `Ctrl-O` | resume in a new terminal tab (tmux, zellij, wezterm, kitty, iTerm2, Terminal.app, GNOME Terminal, Konsole, Windows Terminal, …) |
+| `Ctrl-E` | open the project in your editor (asks which one the first time; `Ctrl-A i` to change) |
+| `Ctrl-O` | resume in a new tab of the terminal you're in: tmux, zellij, WezTerm, kitty, iTerm2, Terminal, Ghostty, Warp, GNOME Terminal, Konsole, Windows Terminal |
 | `Ctrl-Y` | copy `cd … && claude --resume …` |
 | `Ctrl-F` | toggle full-text search |
 | `Ctrl-D` | have Claude describe the selected session |
@@ -243,10 +256,10 @@ otherwise the branch name. Only groups of two or more sessions are listed.
 | Role | Evidence |
 |---|---|
 | ● created | `gh pr create` (number taken from its output), `gh api -X POST repos/o/r/pulls`, MCP `create_pull_request`, or a synced PR whose body links this session |
-| ◆ reviewed | `gh pr review`, review/comment POSTs to `…/pulls/N/reviews`, MCP review tools, `/review N` / `/code-review N`, or a prompt asking to review a PR |
-| ✔ merged | `gh pr merge`, MCP `merge_pull_request` |
-| ✎ commented | `gh pr comment`, `…/issues/N/comments`, MCP `add_issue_comment` |
-| ↻ worked on | `gh pr checkout/edit`, MCP `update_pull_request`, PR activity subscriptions, "address the review comments on #N", or the PR's head branch |
+| ♦ reviewed | `gh pr review`, review/comment POSTs to `…/pulls/N/reviews`, MCP review tools, `/review N` / `/code-review N`, or a prompt asking to review a PR |
+| √ merged | `gh pr merge`, MCP `merge_pull_request` |
+| » commented | `gh pr comment`, `…/issues/N/comments`, MCP `add_issue_comment` |
+| ► worked on | `gh pr checkout/edit`, MCP `update_pull_request`, PR activity subscriptions, "address the review comments on #N", or the PR's head branch |
 | · viewed / mentioned | `gh pr view/diff`, MCP `pull_request_read`, PR URLs in prompts or replies |
 
 A bare `#42` is resolved to a repo using, in order: `-R owner/repo`, the
@@ -263,6 +276,8 @@ and other PR URLs in the same session.
   "ignored_projects": [],
   "describe_model": "claude-opus-5-5",
   "context_windows": {},
+  "theme": "dark",
+  "editor": "cursor",
   "tickets": {
     "ABC": "https://acme.atlassian.net/browse/{key}",
     "ENG": "https://linear.app/acme/issue/{key}"
@@ -272,12 +287,19 @@ and other PR URLs in the same session.
 
 - `claude_projects_dir` defaults to `$CLAUDE_CONFIG_DIR/projects` or
   `~/.claude/projects`.
-- `context_windows` overrides the context size used for the ◔ percentage,
+- `context_windows` overrides the context size used for the context percentage,
   matched as a substring of the model id, e.g. `{"sonnet-4-5": 1000000}`.
   Built in: 1M for the Claude 5 family, Opus 4.6–4.8, Sonnet 4.6 and `[1m]`
   models; 200k for the rest.
+- `theme`: `"dark"` (default) draws the TUI in its own gray-black colors, so
+  it looks the same in any terminal; `"terminal"` uses your terminal's
+  palette instead.
+- `editor` is set for you when you pick one (`Ctrl-E`, `cctrail editor set`).
+  Any shell command works; the project folder is added at the end.
+  `$CCTRAIL_EDITOR` is used if nothing is set.
 - `tickets` maps a ticket prefix to its URL (`{key}` is replaced; `"*"`
-  matches any prefix). Keys in branch names are always picked up. A key that
+  matches any prefix). You don't need to edit it by hand: `cctrail tickets
+  set` and the `Ctrl-K` prompt write it. Keys in branch names are always picked up. A key that
   appears only in a prompt counts when its prefix is listed here, or was seen
   in some branch name. That keeps things like `UTF-8` and `SHA-256` out.
 - `cctrail ignore <substring>` / `cctrail unignore <substring>` stops (or

@@ -9,6 +9,7 @@ use crate::prview::{self, Actor, PrEntry};
 use crate::search::{self, Corpus, Opts, Ranker};
 use crate::tasks::{self, Task};
 use crate::text::{age, duration, home_short, local_time, truncate};
+use crate::theme as th;
 use crate::transcript::{self, Entry, Kind};
 use anyhow::Result;
 use ratatui::backend::CrosstermBackend;
@@ -50,6 +51,19 @@ enum Step {
     Suspend(std::process::Command),
 }
 
+/// Text being typed into the status bar.
+#[derive(Clone)]
+enum InputKind {
+    Note {
+        id: String,
+    },
+    /// Ask for the tracker address the first time a prefix's ticket is opened.
+    TicketLink {
+        prefix: String,
+        key: String,
+    },
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Action {
     View,
@@ -57,6 +71,7 @@ enum Action {
     OpenTicket,
     OpenCloud,
     Editor,
+    PickEditor,
     Export,
     Pin,
     Note,
@@ -73,6 +88,7 @@ const MENU: &[(char, Action, &str)] = &[
     ('k', Action::OpenTicket, "open its Jira / Linear ticket"),
     ('w', Action::OpenCloud, "open the claude.ai session"),
     ('e', Action::Editor, "open the project in your editor"),
+    ('i', Action::PickEditor, "choose which editor to use"),
     ('m', Action::Export, "export as Markdown"),
     ('p', Action::Pin, "pin / unpin"),
     ('n', Action::Note, "add / edit a note"),
@@ -154,43 +170,43 @@ impl Viewer {
                 Kind::User => {
                     rows.push((Style::new(), String::new()));
                     rows.push((
-                        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                        format!("▶ You · {when}"),
+                        Style::new().fg(th::accent()).add_modifier(Modifier::BOLD),
+                        format!("► You · {when}"),
                     ));
                     rows.extend(
                         wrap(&e.text, w)
                             .into_iter()
-                            .map(|l| (Style::new().fg(Color::White), l)),
+                            .map(|l| (Style::new().fg(th::bright()), l)),
                     );
                 }
                 Kind::Assistant => {
                     rows.push((Style::new(), String::new()));
                     rows.push((
-                        Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
-                        "◀ Claude".to_string(),
+                        Style::new().fg(th::green()).add_modifier(Modifier::BOLD),
+                        "◄ Claude".to_string(),
                     ));
                     rows.extend(wrap(&e.text, w).into_iter().map(|l| (Style::new(), l)));
                 }
                 Kind::Tool => rows.push((
-                    Style::new().fg(Color::Yellow),
-                    format!("  ⚙ {}", truncate(&e.text, w.saturating_sub(4))),
+                    Style::new().fg(th::amber()),
+                    format!("  › {}", truncate(&e.text, w.saturating_sub(4))),
                 )),
                 Kind::Output | Kind::Error if self.outputs => {
                     let st = if e.kind == Kind::Error {
-                        Style::new().fg(Color::Red)
+                        Style::new().fg(th::red())
                     } else {
-                        DIM
+                        dim()
                     };
                     for l in e.text.lines().take(12) {
                         rows.push((st, format!("    │ {}", truncate(l, w.saturating_sub(6)))));
                     }
                 }
-                Kind::Meta => rows.push((Style::new().fg(Color::Magenta), e.text.clone())),
+                Kind::Meta => rows.push((Style::new().fg(th::purple()), e.text.clone())),
                 _ => {}
             }
         }
         if rows.is_empty() {
-            rows.push((DIM, "(this transcript has no readable messages)".into()));
+            rows.push((dim(), "(this transcript has no readable messages)".into()));
         }
         self.rows = rows;
         self.scroll = self.scroll.min(self.rows.len().saturating_sub(1));
@@ -254,29 +270,33 @@ struct App {
     viewer: Option<Viewer>,
     menu: bool,
     /// Note being edited for the target session.
-    note_input: Option<(String, String)>,
+    input: Option<(InputKind, String)>,
+    /// Editor chooser: the editors found, and which one is highlighted.
+    editor_pick: Option<(Vec<launch::Editor>, usize)>,
 }
 
 pub fn role_color(r: Role) -> Color {
     match r {
-        Role::Created => Color::Green,
-        Role::Reviewed => Color::Magenta,
-        Role::Merged => Color::Blue,
-        Role::Commented => Color::Yellow,
-        Role::WorkedOn => Color::Cyan,
-        Role::Viewed | Role::Mentioned => Color::DarkGray,
+        Role::Created => th::green(),
+        Role::Reviewed => th::purple(),
+        Role::Merged => th::blue(),
+        Role::Commented => th::amber(),
+        Role::WorkedOn => th::teal(),
+        Role::Viewed | Role::Mentioned => th::dim(),
     }
 }
 
 pub fn ctx_color(pct: u32) -> Color {
     match pct {
-        0..50 => Color::Green,
-        50..80 => Color::Yellow,
-        _ => Color::Red,
+        0..50 => th::green(),
+        50..80 => th::amber(),
+        _ => th::red(),
     }
 }
 
-const DIM: Style = Style::new().fg(Color::DarkGray);
+fn dim() -> Style {
+    Style::new().fg(th::dim())
+}
 const BOLD: Style = Style::new().add_modifier(Modifier::BOLD);
 
 impl App {
@@ -304,7 +324,8 @@ impl App {
             status: String::new(),
             viewer: None,
             menu: false,
-            note_input: None,
+            input: None,
+            editor_pick: None,
         };
         app.reload(db)?;
         Ok(app)
@@ -435,6 +456,7 @@ fn format_ref((repo, n): &(Option<String>, u32)) -> String {
 }
 
 pub fn run(db: &mut Db, cfg: &Config, initial: &str) -> Result<Outcome> {
+    th::use_terminal_colors(cfg.theme == "terminal");
     let mut app = App::new(db, initial, Context::detect())?;
     if app.sessions.is_empty() {
         app.status = format!(
@@ -566,11 +588,8 @@ fn do_action(app: &mut App, a: Action, db: &mut Db, cfg: &Config) -> Result<Step
             Some(key) => match crate::config::ticket_url(&key) {
                 Some(u) => open(app, Some(u), "ticket"),
                 None => {
-                    app.status = format!(
-                        "{key}: add \"tickets\": {{\"{}\": \"https://…/browse/{{key}}\"}} to {}",
-                        crate::tickets::prefix(&key),
-                        crate::config::config_path().display()
-                    )
+                    let prefix = crate::tickets::prefix(&key).to_string();
+                    app.input = Some((InputKind::TicketLink { prefix, key }, String::new()));
                 }
             },
         },
@@ -592,25 +611,14 @@ fn do_action(app: &mut App, a: Action, db: &mut Db, cfg: &Config) -> Result<Step
             }
         }
         Action::Editor => {
-            if let Some(s) = app.target() {
-                match launch::editor_command(&s.resume_dir()) {
-                    Err(e) => app.status = format!("{e}"),
-                    Ok((mut cmd, true)) => {
-                        app.status = match cmd
-                            .stdout(std::process::Stdio::null())
-                            .stderr(std::process::Stdio::null())
-                            .spawn()
-                        {
-                            Ok(_) => {
-                                format!("Opened {} in your editor", home_short(&s.resume_dir()))
-                            }
-                            Err(e) => format!("Could not start the editor: {e}"),
-                        };
-                    }
-                    Ok((cmd, false)) => return Ok(Step::Suspend(cmd)),
+            if app.target().is_some() {
+                match launch::chosen_editor(crate::config::Config::load().editor.as_deref()) {
+                    Some(ed) => return Ok(open_in_editor(app, &ed)),
+                    None => open_editor_picker(app),
                 }
             }
         }
+        Action::PickEditor => open_editor_picker(app),
         Action::Export => {
             if let Some(s) = app.target().cloned() {
                 let dir = crate::config::data_dir().join("exports");
@@ -646,7 +654,10 @@ fn do_action(app: &mut App, a: Action, db: &mut Db, cfg: &Config) -> Result<Step
         }
         Action::Note => {
             if let Some(s) = app.target() {
-                app.note_input = Some((s.id.clone(), s.note.clone().unwrap_or_default()));
+                app.input = Some((
+                    InputKind::Note { id: s.id.clone() },
+                    s.note.clone().unwrap_or_default(),
+                ));
             }
         }
         Action::Describe => {
@@ -681,6 +692,85 @@ fn do_action(app: &mut App, a: Action, db: &mut Db, cfg: &Config) -> Result<Step
                 app.status = format!("Copied: {}", s.id);
             }
         }
+    }
+    Ok(Step::Stay)
+}
+
+fn open_editor_picker(app: &mut App) {
+    let found = launch::detect_editors();
+    if found.is_empty() {
+        app.status = "No editors found. Set one with: cctrail editor set <command>".into();
+    } else {
+        let current = crate::config::Config::load().editor;
+        let at = current
+            .and_then(|c| found.iter().position(|e| e.command == c))
+            .unwrap_or(0);
+        app.editor_pick = Some((found, at));
+    }
+}
+
+/// Open the target session's project with `editor`.
+fn open_in_editor(app: &mut App, editor: &str) -> Step {
+    let Some(s) = app.target() else {
+        return Step::Stay;
+    };
+    let dir = s.resume_dir();
+    match launch::editor_command(editor, &dir) {
+        Err(e) => app.status = format!("{e}"),
+        Ok((mut cmd, true)) => {
+            app.status = match cmd
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                Ok(_) => format!(
+                    "Opened {} with {editor}  (^a i to choose another editor)",
+                    home_short(&dir)
+                ),
+                Err(e) => format!("Could not start {editor}: {e}"),
+            };
+        }
+        Ok((cmd, false)) => return Step::Suspend(cmd),
+    }
+    Step::Stay
+}
+
+fn editor_pick_key(app: &mut App, k: KeyEvent) -> Result<Step> {
+    let Some((list, at)) = app.editor_pick.as_mut() else {
+        return Ok(Step::Stay);
+    };
+    let chosen = match k.code {
+        KeyCode::Esc => {
+            app.editor_pick = None;
+            return Ok(Step::Stay);
+        }
+        KeyCode::Up => {
+            *at = at.saturating_sub(1);
+            None
+        }
+        KeyCode::Down => {
+            *at = (*at + 1).min(list.len() - 1);
+            None
+        }
+        KeyCode::Enter => Some(*at),
+        KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+            let i = c as usize - '1' as usize;
+            (i < list.len()).then_some(i)
+        }
+        _ => None,
+    };
+    if let Some(i) = chosen {
+        let ed = list[i].clone();
+        app.editor_pick = None;
+        crate::config::set_editor(Some(&ed.command))?;
+        let step = open_in_editor(app, &ed.command);
+        if matches!(step, Step::Stay) && !app.status.starts_with("Could not") {
+            app.status = format!(
+                "{} is now your editor (^a i to change).  {}",
+                ed.label, app.status
+            );
+        }
+        return Ok(step);
     }
     Ok(Step::Stay)
 }
@@ -746,26 +836,51 @@ fn viewer_key(app: &mut App, k: KeyEvent) -> Step {
     Step::Stay
 }
 
-fn note_key(app: &mut App, k: KeyEvent, db: &mut Db) -> Result<Step> {
-    let Some((id, text)) = app.note_input.as_mut() else {
+fn input_key(app: &mut App, k: KeyEvent, db: &mut Db) -> Result<Step> {
+    let Some((kind, text)) = app.input.as_mut() else {
         return Ok(Step::Stay);
     };
     match k.code {
-        KeyCode::Esc => app.note_input = None,
+        KeyCode::Esc => app.input = None,
         KeyCode::Enter => {
-            let (id, text) = (id.clone(), text.trim().to_string());
-            db.set_note(&id, Some(&text))?;
-            app.note_input = None;
-            app.reload_keep(db)?;
-            app.status = if text.is_empty() {
-                "Note cleared".into()
-            } else {
-                "Note saved (it's searchable too)".into()
-            };
+            let (kind, text) = (kind.clone(), text.trim().to_string());
+            app.input = None;
+            match kind {
+                InputKind::Note { id } => {
+                    db.set_note(&id, Some(&text))?;
+                    app.reload_keep(db)?;
+                    app.status = if text.is_empty() {
+                        "Note cleared".into()
+                    } else {
+                        "Note saved (it's searchable too)".into()
+                    };
+                }
+                InputKind::TicketLink { prefix, key } => {
+                    if text.is_empty() {
+                        app.status = "No link saved".into();
+                        return Ok(Step::Stay);
+                    }
+                    match crate::config::ticket_template(&text).and_then(|tpl| {
+                        crate::config::set_ticket_url(&prefix, &tpl)?;
+                        Ok(tpl)
+                    }) {
+                        Err(e) => app.status = format!("Could not save the link: {e}"),
+                        Ok(tpl) => {
+                            app.reload_keep(db)?;
+                            let url = tpl.replace("{key}", &key);
+                            let _ = launch::open_url(&url);
+                            app.status = format!(
+                                "Saved {prefix} links as {tpl} and opened {key}. Change it with `cctrail tickets set`."
+                            );
+                        }
+                    }
+                }
+            }
         }
         KeyCode::Backspace => {
             text.pop();
         }
+        KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => text.clear(),
         KeyCode::Char(c) => text.push(c),
         _ => {}
     }
@@ -778,8 +893,11 @@ fn on_key(app: &mut App, k: KeyEvent, db: &mut Db, cfg: &Config) -> Result<Step>
     if app.viewer.is_some() {
         return Ok(viewer_key(app, k));
     }
-    if app.note_input.is_some() {
-        return note_key(app, k, db);
+    if app.input.is_some() {
+        return input_key(app, k, db);
+    }
+    if app.editor_pick.is_some() {
+        return editor_pick_key(app, k);
     }
     if app.menu {
         app.menu = false;
@@ -953,18 +1071,25 @@ fn draw(f: &mut Frame, app: &mut App) {
         Constraint::Length(1),
     ])
     .areas(f.area());
+    // Our own background, so the look doesn't depend on the terminal's palette.
+    f.render_widget(
+        Block::new().style(Style::new().bg(th::bg()).fg(th::fg())),
+        f.area(),
+    );
+    f.render_widget(Block::new().style(Style::new().bg(th::bar())), top);
+    f.render_widget(Block::new().style(Style::new().bg(th::bar())), bottom);
 
     let tab = |t: Tab, label: String| {
         if app.tab == t {
             Span::styled(
                 format!(" {label} "),
                 Style::new()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
+                    .fg(th::bright())
+                    .bg(th::sel())
                     .add_modifier(Modifier::BOLD),
             )
         } else {
-            Span::styled(format!(" {label} "), DIM)
+            Span::styled(format!(" {label} "), dim())
         }
     };
     let mut head = vec![
@@ -978,27 +1103,30 @@ fn draw(f: &mut Frame, app: &mut App) {
     ];
     if let (Some(c), true) = (&app.ctx, app.here_first) {
         head.push(Span::styled(
-            format!("◉ {} ", c.label()),
-            Style::new().fg(Color::Green),
+            format!("● {} ", c.label()),
+            Style::new().fg(th::green()),
         ));
     }
     if app.hide_quick {
         head.push(Span::styled(
             "[quick hidden] ",
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(th::amber()),
         ));
     }
     if app.deep {
-        head.push(Span::styled("[full-text] ", Style::new().fg(Color::Yellow)));
+        head.push(Span::styled("[full-text] ", Style::new().fg(th::amber())));
     }
     head.push(Span::styled(
-        "❯ ",
-        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        "› ",
+        Style::new().fg(th::accent()).add_modifier(Modifier::BOLD),
     ));
     head.push(Span::raw(app.query.clone()));
-    head.push(Span::styled("█", Style::new().fg(Color::Cyan)));
+    head.push(Span::styled("█", Style::new().fg(th::accent())));
     if app.query.is_empty() {
-        head.push(Span::styled(" search · #123 · p: b: f: @today has:pr", DIM));
+        head.push(Span::styled(
+            " search · #123 · p: b: f: @today has:pr",
+            dim(),
+        ));
     }
     f.render_widget(Paragraph::new(Line::from(head)), top);
 
@@ -1015,6 +1143,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         draw_viewer(f, app, main, bottom);
         return;
     }
+    f.render_widget(Block::new().style(Style::new().bg(th::panel())), right);
     match app.tab {
         Tab::Sessions => {
             draw_session_list(f, app, left);
@@ -1033,26 +1162,39 @@ fn draw(f: &mut Frame, app: &mut App) {
     if app.menu {
         draw_menu(f, app, main);
     }
-    let help = if let Some((_, text)) = &app.note_input {
+    if app.editor_pick.is_some() {
+        draw_editor_pick(f, app, main);
+    }
+    let help = if let Some((kind, text)) = &app.input {
+        let (label, hint) = match kind {
+            InputKind::Note { .. } => (
+                "Note: ".to_string(),
+                "   enter save · esc cancel · empty clears",
+            ),
+            InputKind::TicketLink { prefix, .. } => (
+                format!("Link for {prefix} tickets (Jira/Linear address or any ticket URL): "),
+                "   enter save & open · esc cancel",
+            ),
+        };
         Line::from(vec![
             Span::styled(
-                "Note: ",
-                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                label,
+                Style::new().fg(th::amber()).add_modifier(Modifier::BOLD),
             ),
             Span::raw(text.clone()),
-            Span::styled("█", Style::new().fg(Color::Yellow)),
-            Span::styled("   enter save · esc cancel · empty clears", DIM),
+            Span::styled("█", Style::new().fg(th::amber())),
+            Span::styled(hint, dim()),
         ])
     } else if !app.status.is_empty() {
         Line::from(Span::styled(
             app.status.clone(),
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(th::amber()),
         ))
     } else {
         let k = |key: &'static str, what: &'static str| {
             vec![
-                Span::styled(key, Style::new().fg(Color::Cyan)),
-                Span::styled(format!(" {what}  "), DIM),
+                Span::styled(key, Style::new().fg(th::accent())),
+                Span::styled(format!(" {what}  "), dim()),
             ]
         };
         let mut v = Vec::new();
@@ -1086,15 +1228,15 @@ fn draw_menu(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(
                 format!(" {key} "),
                 Style::new()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
+                    .fg(th::on_accent())
+                    .bg(th::accent())
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!("  {what}")),
         ]));
     }
     lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled("any other key closes", DIM)));
+    lines.push(Line::from(Span::styled("any other key closes", dim())));
     let h = (lines.len() as u16 + 2).min(area.height);
     let w = 52.min(area.width);
     let r = Rect {
@@ -1108,8 +1250,75 @@ fn draw_menu(f: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(lines).block(
             Block::bordered()
                 .title(" Actions ")
-                .border_style(Style::new().fg(Color::Cyan)),
+                .border_style(Style::new().fg(th::accent())),
         ),
+        r,
+    );
+}
+
+fn draw_editor_pick(f: &mut Frame, app: &App, area: Rect) {
+    let Some((list, at)) = &app.editor_pick else {
+        return;
+    };
+    let mut lines = vec![
+        Line::from(Span::styled("Open projects with…", BOLD)),
+        Line::from(Span::styled("cctrail remembers your choice", dim())),
+        Line::raw(""),
+    ];
+    for (i, e) in list.iter().enumerate() {
+        let sel = i == *at;
+        let st = if sel {
+            Style::new().bg(th::sel()).fg(th::bright())
+        } else {
+            Style::new()
+        };
+        let num = if i < 9 {
+            format!(" {} ", i + 1)
+        } else {
+            "   ".into()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(num, Style::new().fg(th::accent())),
+            Span::styled(
+                format!(" {:<16}", e.label),
+                st.add_modifier(if sel {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+            ),
+            Span::styled(
+                format!(
+                    " {}{}",
+                    truncate(&e.command, 24),
+                    if e.gui { "" } else { " (terminal)" }
+                ),
+                if sel { st.fg(th::dim()) } else { dim() },
+            ),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "↑↓ / 1-9 choose · enter open · esc cancel",
+        dim(),
+    )));
+    let h = (lines.len() as u16 + 2).min(area.height);
+    let w = 56.min(area.width);
+    let r = Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, r);
+    f.render_widget(
+        Paragraph::new(lines)
+            .style(Style::new().bg(th::panel()))
+            .block(
+                Block::bordered()
+                    .title(" Editor ")
+                    .border_style(Style::new().fg(th::accent())),
+            ),
         r,
     );
 }
@@ -1129,7 +1338,7 @@ fn draw_viewer(f: &mut Frame, app: &mut App, main: Rect, bottom: Rect) {
         .take(v.height)
         .map(|(st, t)| {
             if !q.is_empty() && t.to_lowercase().contains(&q) {
-                Line::from(Span::styled(t.clone(), st.bg(Color::Indexed(58))))
+                Line::from(Span::styled(t.clone(), st.bg(th::find())))
             } else {
                 Line::from(Span::styled(t.clone(), *st))
             }
@@ -1149,26 +1358,26 @@ fn draw_viewer(f: &mut Frame, app: &mut App, main: Rect, bottom: Rect) {
         Paragraph::new(lines).block(
             Block::bordered()
                 .title(title)
-                .border_style(Style::new().fg(Color::Cyan)),
+                .border_style(Style::new().fg(th::accent())),
         ),
         main,
     );
     let help = if let Some(input) = &v.input {
         Line::from(vec![
-            Span::styled("/", Style::new().fg(Color::Yellow)),
+            Span::styled("/", Style::new().fg(th::amber())),
             Span::raw(input.clone()),
-            Span::styled("█", Style::new().fg(Color::Yellow)),
+            Span::styled("█", Style::new().fg(th::amber())),
         ])
     } else if !app.status.is_empty() {
         Line::from(Span::styled(
             app.status.clone(),
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(th::amber()),
         ))
     } else {
         let k = |key: &'static str, what: &'static str| {
             vec![
-                Span::styled(key, Style::new().fg(Color::Cyan)),
-                Span::styled(format!(" {what}  "), DIM),
+                Span::styled(key, Style::new().fg(th::accent())),
+                Span::styled(format!(" {what}  "), dim()),
             ]
         };
         let mut x = Vec::new();
@@ -1200,7 +1409,7 @@ fn pr_badges(s: &SessionRow, max: usize) -> Vec<Span<'static>> {
         }
         seen.push(l.number);
         if seen.len() > max {
-            v.push(Span::styled("…", DIM));
+            v.push(Span::styled("…", dim()));
             break;
         }
         v.push(Span::styled(
@@ -1225,64 +1434,65 @@ fn draw_session_list(f: &mut Frame, app: &mut App, area: Rect) {
             };
             let task = app.corpus.task_of[i].map(|t| app.tasks[t].sessions.len());
             let a = format!("{:>4} ", age(s.ended.as_deref().or(s.started.as_deref())));
-            let mut l1 = vec![Span::styled(a, DIM)];
-            let title_style = if s.missing { DIM } else { BOLD };
+            let mut l1 = vec![Span::styled(a, dim())];
+            let title_style = if s.missing { dim() } else { BOLD };
             if s.pinned {
-                l1.push(Span::styled("★ ", Style::new().fg(Color::Yellow)));
+                l1.push(Span::styled("↑ ", Style::new().fg(th::amber())));
             }
             l1.push(Span::styled(
                 truncate(&s.title(), width.saturating_sub(6)),
                 title_style,
             ));
             let here = match tier {
-                crate::context::TIER_BRANCH => Span::styled("   ◉ ", Style::new().fg(Color::Green)),
-                crate::context::TIER_PLACE => Span::styled("   ○ ", Style::new().fg(Color::Green)),
+                crate::context::TIER_BRANCH => Span::styled("   ● ", Style::new().fg(th::green())),
+                crate::context::TIER_PLACE => Span::styled("   ○ ", Style::new().fg(th::green())),
                 _ => Span::raw("     "),
             };
             let mut l2 = vec![
                 here,
-                Span::styled(s.project_name(), Style::new().fg(Color::Blue)),
+                Span::styled(s.project_name(), Style::new().fg(th::project())),
             ];
             if let Some(b) = &s.branch {
-                l2.push(Span::styled(format!(" ⎇ {}", truncate(b, 28)), DIM));
+                l2.push(Span::styled(format!(" · {}", truncate(b, 28)), dim()));
             }
             if let Some(pct) = s.context_pct() {
                 l2.push(Span::styled(
-                    format!(" ◔{pct}%"),
+                    format!("  {pct}%"),
                     Style::new().fg(ctx_color(pct)),
                 ));
             }
             if s.cloud_id.is_some() || s.entrypoint.as_deref() == Some("remote") {
-                l2.push(Span::styled(" ☁", DIM));
+                l2.push(Span::styled("  cloud", dim()));
             }
             if s.missing {
                 l2.push(Span::styled(
                     " (transcript deleted)",
-                    Style::new().fg(Color::Red),
+                    Style::new().fg(th::red()),
                 ));
             }
             l2.extend(pr_badges(s, 4));
             if let Some(t) = s.tickets.first() {
-                l2.push(Span::styled(format!(" ⚑{t}"), Style::new().fg(Color::Cyan)));
+                l2.push(Span::styled(format!("  {t}"), Style::new().fg(th::teal())));
             }
             if s.note.is_some() {
-                l2.push(Span::styled(" ✎", Style::new().fg(Color::Yellow)));
+                l2.push(Span::styled("  ≡", Style::new().fg(th::amber())));
             }
             if s.hidden {
-                l2.push(Span::styled(" (hidden)", DIM));
+                l2.push(Span::styled(" (hidden)", dim()));
             }
             if let Some(n) = task {
-                l2.push(Span::styled(
-                    format!("  ⋯ task of {n}"),
-                    Style::new().fg(Color::Yellow),
-                ));
+                l2.push(Span::styled(format!("  ×{n}"), dim()));
             }
             ListItem::new(Text::from(vec![Line::from(l1), Line::from(l2)]))
         })
         .collect();
     let list = List::new(items)
-        .block(Block::new().borders(Borders::RIGHT).border_style(DIM))
-        .highlight_style(Style::new().bg(Color::Indexed(236)))
+        .block(
+            Block::new()
+                .borders(Borders::RIGHT)
+                .border_style(Style::new().fg(th::faint())),
+        )
+        .highlight_style(Style::new().bg(th::sel()))
         .highlight_symbol("▌")
         .highlight_spacing(HighlightSpacing::Always);
     f.render_stateful_widget(list, area, &mut app.list);
@@ -1291,7 +1501,7 @@ fn draw_session_list(f: &mut Frame, app: &mut App, area: Rect) {
 fn wrap_lines(label: &str, body: &str, style: Style) -> Vec<Line<'static>> {
     let mut out = vec![Line::from(Span::styled(
         label.to_string(),
-        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        Style::new().fg(th::accent()).add_modifier(Modifier::BOLD),
     ))];
     for l in body.lines() {
         out.push(Line::from(Span::styled(l.to_string(), style)));
@@ -1312,22 +1522,22 @@ fn actor_name(app: &App, a: &Actor) -> String {
 fn draw_session_preview(f: &mut Frame, app: &App, area: Rect) {
     let Some(s) = app.selected() else {
         f.render_widget(
-            Paragraph::new(Span::styled("  No matching sessions.", DIM)),
+            Paragraph::new(Span::styled("  No matching sessions.", dim())),
             area,
         );
         return;
     };
     let me = app.shown[app.list.selected().unwrap_or(0)];
     let mut lines: Vec<Line> = vec![
-        Line::from(Span::styled(s.title(), BOLD.fg(Color::White))),
+        Line::from(Span::styled(s.title(), BOLD.fg(th::bright()))),
         Line::from(vec![
-            Span::styled(home_short(&s.resume_dir()), Style::new().fg(Color::Blue)),
+            Span::styled(home_short(&s.resume_dir()), Style::new().fg(th::project())),
             Span::styled(
                 s.branch
                     .as_ref()
-                    .map(|b| format!("  ⎇ {b}"))
+                    .map(|b| format!(" · {b}"))
                     .unwrap_or_default(),
-                DIM,
+                dim(),
             ),
         ]),
     ];
@@ -1346,7 +1556,7 @@ fn draw_session_preview(f: &mut Frame, app: &App, area: Rect) {
     if let Some(m) = &s.model {
         meta.push_str(&format!(" · {m}"));
     }
-    lines.push(Line::from(Span::styled(meta, DIM)));
+    lines.push(Line::from(Span::styled(meta, dim())));
     if let (Some(c), Some(pct)) = (s.context_summary(), s.context_pct()) {
         let hint = if pct >= 80 {
             "  — nearly full: consider a fresh session"
@@ -1354,29 +1564,29 @@ fn draw_session_preview(f: &mut Frame, app: &App, area: Rect) {
             ""
         };
         lines.push(Line::from(vec![
-            Span::styled(format!("◔ {c}"), Style::new().fg(ctx_color(pct))),
-            Span::styled(hint, DIM),
+            Span::styled(c.to_string(), Style::new().fg(ctx_color(pct))),
+            Span::styled(hint, dim()),
         ]));
     }
-    lines.push(Line::from(Span::styled(format!("id {}", s.id), DIM)));
+    lines.push(Line::from(Span::styled(format!("id {}", s.id), dim())));
     if let Some(n) = &s.note {
         lines.push(Line::from(vec![
-            Span::styled("✎ ", Style::new().fg(Color::Yellow)),
-            Span::styled(n.clone(), Style::new().fg(Color::Yellow)),
+            Span::styled("note: ", Style::new().fg(th::amber())),
+            Span::styled(n.clone(), Style::new().fg(th::amber())),
         ]));
     }
     for t in &s.tickets {
-        let url = crate::config::ticket_url(t)
-            .unwrap_or_else(|| "(^k needs a tickets URL in the config)".into());
+        let url =
+            crate::config::ticket_url(t).unwrap_or_else(|| "(press ^k to set its link)".into());
         lines.push(Line::from(vec![
-            Span::styled(format!("⚑ {t}  "), Style::new().fg(Color::Cyan)),
-            Span::styled(url, DIM),
+            Span::styled(format!("{t}  "), Style::new().fg(th::teal())),
+            Span::styled(url, dim()),
         ]));
     }
     if let Some(c) = &s.cloud_id {
         lines.push(Line::from(Span::styled(
-            format!("☁ https://claude.ai/code/{c}"),
-            DIM,
+            format!("cloud: https://claude.ai/code/{c}"),
+            dim(),
         )));
     }
     lines.push(Line::raw(""));
@@ -1392,18 +1602,18 @@ fn draw_session_preview(f: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(vec![
             Span::styled(
                 "Part of task ",
-                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::new().fg(th::accent()).add_modifier(Modifier::BOLD),
             ),
             Span::styled(truncate(&t.title, 50), BOLD),
-            Span::styled(format!("  ({} sessions)", t.sessions.len()), DIM),
+            Span::styled(format!("  ({} sessions)", t.sessions.len()), dim()),
         ]));
         for &i in t.sessions.iter().filter(|&&i| i != me).take(4) {
             let o = &app.sessions[i];
             let when = if i < me { "later  " } else { "earlier" };
             lines.push(Line::from(vec![
-                Span::styled(format!(" {when} "), DIM),
-                Span::styled(format!("{} ", o.short_id()), Style::new().fg(Color::Blue)),
-                Span::styled(format!("{:>4} ", age(o.ended.as_deref())), DIM),
+                Span::styled(format!(" {when} "), dim()),
+                Span::styled(format!("{} ", o.short_id()), Style::new().fg(th::project())),
+                Span::styled(format!("{:>4} ", age(o.ended.as_deref())), dim()),
                 Span::raw(truncate(&o.title(), 48)),
             ]));
         }
@@ -1413,7 +1623,7 @@ fn draw_session_preview(f: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
             "Pull requests",
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::new().fg(th::accent()).add_modifier(Modifier::BOLD),
         )));
         for (l, also) in sig {
             let key = if l.repo.is_empty() {
@@ -1437,7 +1647,7 @@ fn draw_session_preview(f: &mut Frame, app: &App, area: Rect) {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(key),
-                Span::styled(title, DIM),
+                Span::styled(title, dim()),
                 Span::styled(
                     if also.is_empty() {
                         String::new()
@@ -1450,7 +1660,7 @@ fn draw_session_preview(f: &mut Frame, app: &App, area: Rect) {
                                 .join(", ")
                         )
                     },
-                    DIM,
+                    dim(),
                 ),
             ]));
             // Cross-session context: who else created / reviewed this PR.
@@ -1466,7 +1676,7 @@ fn draw_session_preview(f: &mut Frame, app: &App, area: Rect) {
                         .collect();
                     if !others.is_empty() {
                         lines.push(Line::from(vec![
-                            Span::raw("     ↳ "),
+                            Span::raw("     └ "),
                             Span::styled(
                                 format!("{} in another session: ", role.as_str()),
                                 Style::new().fg(role_color(role)),
@@ -1491,7 +1701,7 @@ fn draw_session_preview(f: &mut Frame, app: &App, area: Rect) {
         lines.extend(wrap_lines(
             &format!("Files edited ({})", s.files_edited.len()),
             &body,
-            DIM,
+            dim(),
         ));
     }
     if let Some(lp) = s
@@ -1529,16 +1739,16 @@ fn draw_pr_list(f: &mut Frame, app: &mut App, area: Rect) {
             let p = &app.prs[i];
             let mut l1 = vec![];
             if p.born_from_claude() {
-                l1.push(Span::styled("● ", Style::new().fg(Color::Green)));
+                l1.push(Span::styled("● ", Style::new().fg(th::green())));
             } else {
-                l1.push(Span::styled("○ ", DIM));
+                l1.push(Span::styled("○ ", dim()));
             }
             l1.push(Span::styled(p.key(), BOLD));
             if let Some(st) = p.state() {
                 let c = match st {
-                    "open" => Color::Green,
-                    "merged" => Color::Magenta,
-                    _ => Color::Red,
+                    "open" => th::green(),
+                    "merged" => th::purple(),
+                    _ => th::red(),
                 };
                 l1.push(Span::styled(format!(" [{st}]"), Style::new().fg(c)));
             }
@@ -1551,13 +1761,17 @@ fn draw_pr_list(f: &mut Frame, app: &mut App, area: Rect) {
             let story = truncate(&p.story(&app.sessions), width.saturating_sub(4));
             ListItem::new(Text::from(vec![
                 Line::from(l1),
-                Line::from(Span::styled(format!("  {story}"), DIM)),
+                Line::from(Span::styled(format!("  {story}"), dim())),
             ]))
         })
         .collect();
     let list = List::new(items)
-        .block(Block::new().borders(Borders::RIGHT).border_style(DIM))
-        .highlight_style(Style::new().bg(Color::Indexed(236)))
+        .block(
+            Block::new()
+                .borders(Borders::RIGHT)
+                .border_style(Style::new().fg(th::faint())),
+        )
+        .highlight_style(Style::new().bg(th::sel()))
         .highlight_symbol("▌")
         .highlight_spacing(HighlightSpacing::Always);
     f.render_stateful_widget(list, area, &mut app.pr_list);
@@ -1570,32 +1784,32 @@ fn draw_pr_preview(f: &mut Frame, app: &App, area: Rect) {
         } else {
             "  No matching PRs."
         };
-        f.render_widget(Paragraph::new(Text::styled(msg, DIM)), area);
+        f.render_widget(Paragraph::new(Text::styled(msg, dim())), area);
         return;
     };
     let mut lines = vec![Line::from(vec![
-        Span::styled(p.key(), BOLD.fg(Color::White)),
+        Span::styled(p.key(), BOLD.fg(th::bright())),
         Span::styled(
             p.state().map(|s| format!("  [{s}]")).unwrap_or_default(),
-            DIM,
+            dim(),
         ),
     ])];
     if let Some(t) = p.title() {
         lines.push(Line::from(Span::styled(t.to_string(), BOLD)));
     }
     if let Some(u) = pr_url(p) {
-        lines.push(Line::from(Span::styled(u, DIM)));
+        lines.push(Line::from(Span::styled(u, dim())));
     }
     if p.meta.is_none() {
         lines.push(Line::from(Span::styled(
             "(no GitHub metadata — `cctrail sync` fetches title/state)",
-            DIM,
+            dim(),
         )));
     }
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         p.story(&app.sessions),
-        Style::new().fg(Color::Yellow),
+        Style::new().fg(th::amber()),
     )));
     lines.push(Line::raw(""));
     for (l, also) in p.grouped() {
@@ -1635,13 +1849,13 @@ fn draw_pr_preview(f: &mut Frame, app: &App, area: Rect) {
                     .fg(role_color(l.role))
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!("{who}  "), Style::new().fg(Color::Blue)),
-            Span::styled(format!("{when}  "), DIM),
+            Span::styled(format!("{who}  "), Style::new().fg(th::project())),
+            Span::styled(format!("{when}  "), dim()),
             Span::raw(truncate(&title, 50)),
         ]));
         lines.push(Line::from(Span::styled(
             format!("             {}{also}", l.evidence),
-            DIM,
+            dim(),
         )));
     }
     f.render_widget(
@@ -1661,7 +1875,7 @@ fn draw_task_list(f: &mut Frame, app: &mut App, area: Rect) {
             let t = &app.tasks[ti];
             let newest = &app.sessions[t.sessions[0]];
             let l1 = vec![
-                Span::styled(format!("{:>4} ", age(newest.ended.as_deref())), DIM),
+                Span::styled(format!("{:>4} ", age(newest.ended.as_deref())), dim()),
                 Span::styled(truncate(&t.title, width.saturating_sub(6)), BOLD),
             ];
             let here = t
@@ -1673,26 +1887,26 @@ fn draw_task_list(f: &mut Frame, app: &mut App, area: Rect) {
             let mut l2 = vec![
                 Span::styled(
                     if app.here_first && here > 0 {
-                        "   ◉ "
+                        "   ● "
                     } else {
                         "     "
                     },
-                    Style::new().fg(Color::Green),
+                    Style::new().fg(th::green()),
                 ),
-                Span::styled(t.project.clone(), Style::new().fg(Color::Blue)),
+                Span::styled(t.project.clone(), Style::new().fg(th::project())),
             ];
             if let Some(b) = &t.branch {
-                l2.push(Span::styled(format!(" ⎇ {}", truncate(b, 26)), DIM));
+                l2.push(Span::styled(format!(" · {}", truncate(b, 26)), dim()));
             }
             l2.push(Span::styled(
                 format!(" · {} sessions", t.sessions.len()),
-                Style::new().fg(Color::Yellow),
+                Style::new().fg(th::amber()),
             ));
             if t.cost_usd > 0.0 {
-                l2.push(Span::styled(format!(" · ${:.2}", t.cost_usd), DIM));
+                l2.push(Span::styled(format!(" · ${:.2}", t.cost_usd), dim()));
             }
             if let Some(k) = t.tickets.first() {
-                l2.push(Span::styled(format!(" ⚑{k}"), Style::new().fg(Color::Cyan)));
+                l2.push(Span::styled(format!("  {k}"), Style::new().fg(th::teal())));
             }
             for &pi in t.prs.iter().take(3) {
                 let p = &app.prs[pi];
@@ -1713,8 +1927,12 @@ fn draw_task_list(f: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
     let list = List::new(items)
-        .block(Block::new().borders(Borders::RIGHT).border_style(DIM))
-        .highlight_style(Style::new().bg(Color::Indexed(236)))
+        .block(
+            Block::new()
+                .borders(Borders::RIGHT)
+                .border_style(Style::new().fg(th::faint())),
+        )
+        .highlight_style(Style::new().bg(th::sel()))
         .highlight_symbol("▌")
         .highlight_spacing(HighlightSpacing::Always);
     f.render_stateful_widget(list, area, &mut app.task_list);
@@ -1727,19 +1945,19 @@ fn draw_task_preview(f: &mut Frame, app: &App, area: Rect) {
         } else {
             "  No matching tasks."
         };
-        f.render_widget(Paragraph::new(Text::styled(msg, DIM)), area);
+        f.render_widget(Paragraph::new(Text::styled(msg, dim())), area);
         return;
     };
     let mut lines = vec![
-        Line::from(Span::styled(t.title.clone(), BOLD.fg(Color::White))),
+        Line::from(Span::styled(t.title.clone(), BOLD.fg(th::bright()))),
         Line::from(vec![
-            Span::styled(t.project.clone(), Style::new().fg(Color::Blue)),
+            Span::styled(t.project.clone(), Style::new().fg(th::project())),
             Span::styled(
                 t.branch
                     .as_ref()
-                    .map(|b| format!("  ⎇ {b}"))
+                    .map(|b| format!(" · {b}"))
                     .unwrap_or_default(),
-                DIM,
+                dim(),
             ),
             Span::styled(
                 if t.cost_usd > 0.0 {
@@ -1747,15 +1965,15 @@ fn draw_task_preview(f: &mut Frame, app: &App, area: Rect) {
                 } else {
                     String::new()
                 },
-                DIM,
+                dim(),
             ),
         ]),
     ];
     for k in &t.tickets {
         let url = crate::config::ticket_url(k).unwrap_or_default();
         lines.push(Line::from(vec![
-            Span::styled(format!("⚑ {k}  "), Style::new().fg(Color::Cyan)),
-            Span::styled(url, DIM),
+            Span::styled(format!("{k}  "), Style::new().fg(th::teal())),
+            Span::styled(url, dim()),
         ]));
     }
     for &pi in &t.prs {
@@ -1764,15 +1982,15 @@ fn draw_task_preview(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(format!("{} ", p.key()), BOLD),
             Span::styled(
                 p.state().map(|s| format!("[{s}] ")).unwrap_or_default(),
-                DIM,
+                dim(),
             ),
-            Span::styled(p.story(&app.sessions), Style::new().fg(Color::Yellow)),
+            Span::styled(p.story(&app.sessions), Style::new().fg(th::amber())),
         ]));
     }
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         format!("Sessions ({}), oldest first", t.sessions.len()),
-        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        Style::new().fg(th::accent()).add_modifier(Modifier::BOLD),
     )));
     for &i in t.sessions.iter().rev() {
         let s = &app.sessions[i];
@@ -1796,8 +2014,8 @@ fn draw_task_preview(f: &mut Frame, app: &App, area: Rect) {
             })
             .collect();
         let mut l = vec![
-            Span::styled(format!("{} ", s.short_id()), Style::new().fg(Color::Blue)),
-            Span::styled(format!("{}  ", local_time(s.started.as_deref())), DIM),
+            Span::styled(format!("{} ", s.short_id()), Style::new().fg(th::project())),
+            Span::styled(format!("{}  ", local_time(s.started.as_deref())), dim()),
             Span::raw(truncate(&s.title(), 50)),
         ];
         l.extend(roles);
@@ -1805,14 +2023,14 @@ fn draw_task_preview(f: &mut Frame, app: &App, area: Rect) {
         if let Some(d) = s.description().lines().find(|l| !l.starts_with("Asked:")) {
             lines.push(Line::from(Span::styled(
                 format!("          {}", truncate(d, 80)),
-                DIM,
+                dim(),
             )));
         }
     }
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         "Enter lists these sessions; the newest is selected.",
-        DIM,
+        dim(),
     )));
     f.render_widget(
         Paragraph::new(lines)
