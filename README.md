@@ -78,10 +78,13 @@ sessions first (◉ same branch, ○ same repo). Inside a repo, plain
 - **Claude can search your history too.** `cctrail mcp` is an MCP server,
   so inside a session you can ask *"how did we fix the redis bucket issue
   last time?"* (see [Use from Claude Code](#use-from-claude-code-mcp)).
-- **Fast.** It's written in Rust: transcripts are parsed in parallel, and only
-  changed files are re-parsed. On a synthetic 641 MB history of 2,000
-  sessions, the first index takes about 7 s; after that the automatic
-  re-index on every launch takes about 10 ms, so the picker opens at once.
+- **Fast.** It's written in Rust: transcripts are parsed in parallel, and
+  only files that changed are re-parsed, on every launch. Measured on 4 cores:
+
+  | History | First index | Launch, nothing changed | Launch, a 14 MB session grew | Commands |
+  |---|---|---|---|---|
+  | 100 realistic sessions, 207 MB | 0.2 s | 1 ms | 33 ms | 7–14 ms |
+  | 2,000 synthetic sessions, 641 MB | ~4 s | 10 ms | | |
 
 ## Install
 
@@ -303,4 +306,5 @@ resumed.
 cargo test
 cargo clippy
 cargo run --release -- list
+CCTRAIL_TIMING=1 cargo run --release -- index --full   # time per indexing phase
 ```

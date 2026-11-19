@@ -161,9 +161,22 @@ fn resolve_repos(sessions: &mut [ParsedSession]) {
     }
 }
 
+/// Set `CCTRAIL_TIMING=1` to print how long each indexing phase takes.
+fn phase(label: &str, t: &mut Instant) {
+    if std::env::var_os("CCTRAIL_TIMING").is_some() {
+        eprintln!(
+            "  {label:<14} {:>7.1} ms",
+            t.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    *t = Instant::now();
+}
+
 pub fn run(db: &mut Db, cfg: &Config, full: bool) -> Result<Report> {
     let t0 = Instant::now();
+    let mut t = Instant::now();
     let found = scan(cfg);
+    phase("scan", &mut t);
     let stamps = if full {
         HashMap::new()
     } else {
@@ -180,6 +193,7 @@ pub fn run(db: &mut Db, cfg: &Config, full: bool) -> Result<Report> {
             stamps.get(id.as_ref()) != Some(&(f.mtime, f.size))
         })
         .collect();
+    phase("diff", &mut t);
     let mut parsed: Vec<ParsedSession> = changed
         .par_iter()
         .filter_map(|f| {
@@ -189,9 +203,16 @@ pub fn run(db: &mut Db, cfg: &Config, full: bool) -> Result<Report> {
             Some(s)
         })
         .collect();
+    phase("parse", &mut t);
     resolve_repos(&mut parsed);
+    phase("repos", &mut t);
+    if full {
+        db.clear_derived()?;
+    }
     db.write_sessions(&parsed)?;
+    phase("write", &mut t);
     let missing = db.mark_missing(&present)?;
+    phase("missing", &mut t);
     Ok(Report {
         scanned: found.len(),
         updated: parsed.len(),

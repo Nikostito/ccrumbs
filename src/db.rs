@@ -82,6 +82,16 @@ impl Db {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    /// Empty the tables derived from transcripts in one go (used by `index --full`).
+    /// Deleting full-text rows one by one is what made re-indexes slow.
+    pub fn clear_derived(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "DELETE FROM sessions; DELETE FROM session_prs; DROP TABLE IF EXISTS fts;
+             CREATE VIRTUAL TABLE fts USING fts5(id UNINDEXED, title, body, tokenize='unicode61');",
+        )?;
+        Ok(())
+    }
+
     pub fn write_sessions(&mut self, sessions: &[ParsedSession]) -> Result<()> {
         let tx = self.conn.transaction()?;
         {
@@ -102,7 +112,9 @@ impl Db {
             )?;
             let mut ins_f =
                 tx.prepare("INSERT INTO fts (rowid, id, title, body) VALUES (?1, ?2, ?3, ?4)")?;
+            let mut tm = [std::time::Duration::ZERO; 4];
             for s in sessions {
+                let t = std::time::Instant::now();
                 if let Some(rid) = old_rowid
                     .query_row([&s.id], |r| r.get::<_, i64>(0))
                     .optional()?
@@ -111,6 +123,8 @@ impl Db {
                     del_s.execute([&s.id])?;
                     del_p.execute([&s.id])?;
                 }
+                tm[0] += t.elapsed();
+                let t = std::time::Instant::now();
                 let auto = crate::describe::auto_description(s);
                 let rowid = ins.insert(params![
                     s.id,
@@ -146,6 +160,8 @@ impl Db {
                     s.cost_usd,
                     serde_json::to_string(&s.tickets)?
                 ])?;
+                tm[1] += t.elapsed();
+                let t = std::time::Instant::now();
                 for l in &s.pr_links {
                     ins_p.execute(params![
                         s.id,
@@ -156,6 +172,8 @@ impl Db {
                         l.evidence
                     ])?;
                 }
+                tm[2] += t.elapsed();
+                let t = std::time::Instant::now();
                 let title = [
                     s.custom_title.as_deref(),
                     s.summary.as_deref(),
@@ -166,6 +184,15 @@ impl Db {
                 .collect::<Vec<_>>()
                 .join(" ");
                 ins_f.execute(params![rowid, s.id, title, s.fulltext])?;
+                tm[3] += t.elapsed();
+            }
+            if std::env::var_os("CCTRAIL_TIMING").is_some() {
+                for (label, d) in ["delete old", "session rows", "PR links", "full-text"]
+                    .iter()
+                    .zip(tm)
+                {
+                    eprintln!("    {label:<12} {:>7.1} ms", d.as_secs_f64() * 1000.0);
+                }
             }
         }
         tx.commit()?;
