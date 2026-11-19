@@ -56,80 +56,6 @@ enum Cmd {
         #[arg(long, conflicts_with = "print")]
         print_dir: bool,
     },
-    /// Read a session's conversation.
-    View {
-        id: String,
-        /// Include tool output (shell results, file reads...).
-        #[arg(long)]
-        outputs: bool,
-    },
-    /// Export a session (summary, PRs, files, conversation) as Markdown.
-    Export {
-        id: String,
-        /// Output file; `-` for stdout. Default: ./<id>-<title>.md
-        #[arg(short, long)]
-        output: Option<String>,
-        /// Include tool output (shell results, file reads...).
-        #[arg(long)]
-        outputs: bool,
-        /// Overwrite the output file if it exists.
-        #[arg(short, long)]
-        force: bool,
-    },
-    /// Open a session's PR, ticket or claude.ai page in the browser.
-    /// Target: session id, PR ref (#42, owner/repo#42) or ticket key (ABC-123).
-    Open {
-        target: String,
-        #[arg(long)]
-        pr: bool,
-        #[arg(long)]
-        ticket: bool,
-        #[arg(long)]
-        cloud: bool,
-        /// Print the URL instead of opening it.
-        #[arg(long)]
-        print: bool,
-    },
-    /// Pin a session to the top of the picker.
-    Pin {
-        id: String,
-    },
-    Unpin {
-        id: String,
-    },
-    /// Set a note on a session (no text clears it). Notes are searchable.
-    Note {
-        id: String,
-        text: Vec<String>,
-    },
-    /// Hide a session from lists and search (`is:hidden` shows them).
-    Hide {
-        id: String,
-    },
-    Unhide {
-        id: String,
-    },
-    /// Open a session's project in your editor (see `ccrumbs editor`).
-    Edit {
-        id: String,
-    },
-    /// Which editor projects open in. No arguments: show it and the editors found.
-    Editor {
-        #[command(subcommand)]
-        cmd: Option<EditorCmd>,
-    },
-    /// Print a session's directory: `cd "$(ccrumbs dir a1b2)"`.
-    Dir {
-        id: String,
-    },
-    /// Print shell integration (key binding + `ccd`): eval "$(ccrumbs shell-init zsh)".
-    ShellInit {
-        #[arg(value_parser = ["zsh", "bash", "fish"])]
-        shell: String,
-    },
-    /// Run an MCP server so Claude Code can search your past sessions:
-    /// `claude mcp add ccrumbs -- ccrumbs mcp`.
-    Mcp,
     /// Jump straight into the best match; opens the picker if it's ambiguous.
     /// With no query, continues the latest session from the repo/branch you're in.
     Go {
@@ -152,11 +78,6 @@ enum Cmd {
         #[arg(short, long)]
         short: bool,
     },
-    /// Sessions grouped by task (same branch or same PR).
-    Tasks {
-        #[arg(short = 'n', long, default_value_t = 15)]
-        limit: usize,
-    },
     /// Full-text search over every prompt, reply and command.
     Search {
         terms: Vec<String>,
@@ -164,9 +85,7 @@ enum Cmd {
         limit: usize,
     },
     /// Everything about one session: description, PRs, files, how to resume.
-    Show {
-        id: String,
-    },
+    Show { id: String },
     /// Look up a PR by number/ref and show which sessions created, reviewed or touched it.
     Pr {
         /// 42, #42, owner/repo#42 or a PR URL.
@@ -186,6 +105,32 @@ enum Cmd {
         #[arg(long)]
         claude: bool,
     },
+    /// Sessions grouped by task (same branch, PR or ticket).
+    Tasks {
+        #[arg(short = 'n', long, default_value_t = 15)]
+        limit: usize,
+    },
+    /// Read a session's conversation.
+    View {
+        id: String,
+        /// Include tool output (shell results, file reads...).
+        #[arg(long)]
+        outputs: bool,
+    },
+    /// Open a session's PR, ticket or claude.ai page in the browser.
+    /// Target: session id, PR ref (#42, owner/repo#42) or ticket key (ABC-123).
+    Open {
+        target: String,
+        #[arg(long)]
+        pr: bool,
+        #[arg(long)]
+        ticket: bool,
+        #[arg(long)]
+        cloud: bool,
+        /// Print the URL instead of opening it.
+        #[arg(long)]
+        print: bool,
+    },
     /// Resume a session by id prefix (in place, or in a new tab).
     Resume {
         id: String,
@@ -193,6 +138,53 @@ enum Cmd {
         tab: bool,
         #[arg(long)]
         print: bool,
+    },
+    /// Export a session (summary, PRs, files, conversation) as Markdown.
+    Export {
+        id: String,
+        /// Output file; `-` for stdout. Default: ./<id>-<title>.md
+        #[arg(short, long)]
+        output: Option<String>,
+        /// Include tool output (shell results, file reads...).
+        #[arg(long)]
+        outputs: bool,
+        /// Overwrite the output file if it exists.
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Pin a session to the top of the picker.
+    Pin { id: String },
+    /// Remove a pin.
+    Unpin { id: String },
+    /// Set a note on a session (no text clears it). Notes are searchable.
+    Note { id: String, text: Vec<String> },
+    /// Hide a session from lists and search (`is:hidden` shows them).
+    Hide { id: String },
+    /// Show a hidden session again.
+    Unhide { id: String },
+    /// Open a session's project in your editor (see `ccrumbs editor`).
+    Edit { id: String },
+    /// Which editor projects open in. No arguments: show it and the editors found.
+    Editor {
+        #[command(subcommand)]
+        cmd: Option<EditorCmd>,
+    },
+    /// Print a session's directory: `cd "$(ccrumbs dir a1b2)"`.
+    Dir { id: String },
+    /// Links for Jira / Linear tickets. With no arguments: what's set, and which
+    /// ticket prefixes appear in your sessions.
+    Tickets {
+        #[command(subcommand)]
+        cmd: Option<TicketsCmd>,
+    },
+    /// Pull PR titles/state from GitHub, and find PRs opened by claude.ai cloud sessions (needs `gh`).
+    Sync {
+        /// Repos to sync (owner/repo). Default: every repo seen in your sessions.
+        #[arg(short, long)]
+        repo: Vec<String>,
+        /// Most recently updated PRs to fetch per repo.
+        #[arg(short = 'n', long, default_value_t = 200)]
+        limit: usize,
     },
     /// Write AI titles + descriptions with Claude (needs ANTHROPIC_API_KEY).
     Describe {
@@ -209,37 +201,28 @@ enum Cmd {
         #[arg(long)]
         model: Option<String>,
     },
-    /// Pull PR titles/state from GitHub, and find PRs opened by claude.ai cloud sessions (needs `gh`).
-    Sync {
-        /// Repos to sync (owner/repo). Default: every repo seen in your sessions.
-        #[arg(short, long)]
-        repo: Vec<String>,
-        /// Most recently updated PRs to fetch per repo.
-        #[arg(short = 'n', long, default_value_t = 200)]
-        limit: usize,
+    /// Run an MCP server so Claude Code can search your past sessions:
+    /// `claude mcp add ccrumbs -- ccrumbs mcp`.
+    Mcp,
+    /// Print shell integration (key binding + `ccd`): eval "$(ccrumbs shell-init zsh)".
+    ShellInit {
+        #[arg(value_parser = ["zsh", "bash", "fish"])]
+        shell: String,
     },
+    /// Print shell tab-completion: `ccrumbs completions zsh > ~/.zfunc/_ccrumbs`.
+    Completions { shell: clap_complete::Shell },
     /// Re-index transcripts (runs automatically before every command).
     Index {
         /// Re-parse everything, not just changed files.
         #[arg(long)]
         full: bool,
     },
-    /// Links for Jira / Linear tickets. With no arguments: what's set, and which
-    /// ticket prefixes appear in your sessions.
-    Tickets {
-        #[command(subcommand)]
-        cmd: Option<TicketsCmd>,
-    },
     /// Show configuration and paths.
     Config,
     /// Never index projects whose path contains this.
-    Ignore {
-        pattern: String,
-    },
+    Ignore { pattern: String },
     /// Undo `ignore`.
-    Unignore {
-        pattern: String,
-    },
+    Unignore { pattern: String },
 }
 
 #[derive(Subcommand)]
@@ -314,6 +297,16 @@ fn real_main() -> Result<()> {
     }
     if let Some(Cmd::ShellInit { shell }) = &cli.cmd {
         print!("{}", shell_init(shell));
+        return Ok(());
+    }
+    if let Some(Cmd::Completions { shell }) = &cli.cmd {
+        use clap::CommandFactory;
+        clap_complete::generate(
+            *shell,
+            &mut Cli::command(),
+            "ccrumbs",
+            &mut std::io::stdout(),
+        );
         return Ok(());
     }
     if let Some(Cmd::Mcp) = &cli.cmd {
@@ -456,7 +449,7 @@ fn real_main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::ShellInit { .. } | Cmd::Mcp => unreachable!(),
+        Cmd::ShellInit { .. } | Cmd::Mcp | Cmd::Completions { .. } => unreachable!(),
         Cmd::Go { query, print } => go(&mut db, &cfg, &query.join(" "), print),
         Cmd::List {
             query,

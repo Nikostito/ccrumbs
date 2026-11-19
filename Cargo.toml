@@ -18,6 +18,7 @@ exclude = ["docs/", ".github/", "target/"]
 anyhow = "1.0.104"
 chrono = "0.4.45"
 clap = { version = "4.6.8", features = ["derive"] }
+clap_complete = "4"
 dirs = "7.0.0"
 nucleo-matcher = "0.3.1"
 ratatui = "0.30.2"
