@@ -5,21 +5,21 @@ use crate::context::Context;
 use crate::db::Db;
 use crate::launch;
 use crate::model::{Role, SessionRow};
-use crate::prview::{self, Actor, PrEntry};
+use crate::prview::{self, PrEntry};
 use crate::search::{self, Corpus, Opts, Ranker};
 use crate::tasks::{self, Task};
 use crate::text::{age, duration, home_short, local_time, truncate};
 use crate::theme as th;
+
+mod view;
 use crate::transcript::{self, Entry, Kind};
 use anyhow::Result;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{
-    Block, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
-};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Clear, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
 /// The TUI draws on stderr, so stdout stays free for `pick --print` / `--print-dir`
@@ -271,6 +271,10 @@ struct App {
     menu: bool,
     /// Note being edited for the target session.
     input: Option<(InputKind, String)>,
+    /// First visible row of each list (Sessions, Tasks, PRs).
+    offsets: [usize; 3],
+    /// The `?` overlay.
+    help: bool,
     /// Editor chooser: the editors found, and which one is highlighted.
     editor_pick: Option<(Vec<launch::Editor>, usize)>,
 }
@@ -325,6 +329,8 @@ impl App {
             viewer: None,
             menu: false,
             input: None,
+            offsets: [0; 3],
+            help: false,
             editor_pick: None,
         };
         app.reload(db)?;
@@ -890,6 +896,10 @@ fn input_key(app: &mut App, k: KeyEvent, db: &mut Db) -> Result<Step> {
 fn on_key(app: &mut App, k: KeyEvent, db: &mut Db, cfg: &Config) -> Result<Step> {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     app.status.clear();
+    if app.help {
+        app.help = false;
+        return Ok(Step::Stay);
+    }
     if app.viewer.is_some() {
         return Ok(viewer_key(app, k));
     }
@@ -1049,6 +1059,7 @@ fn on_key(app: &mut App, k: KeyEvent, db: &mut Db, cfg: &Config) -> Result<Step>
             app.query.pop();
             app.refilter(db);
         }
+        (KeyCode::Char('?'), false) if app.query.is_empty() => app.help = true,
         (KeyCode::Char(c), false) => {
             app.query.push(c);
             app.refilter(db);
@@ -1079,142 +1090,65 @@ fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(Block::new().style(Style::new().bg(th::bar())), top);
     f.render_widget(Block::new().style(Style::new().bg(th::bar())), bottom);
 
-    let tab = |t: Tab, label: String| {
-        if app.tab == t {
-            Span::styled(
-                format!(" {label} "),
-                Style::new()
-                    .fg(th::bright())
-                    .bg(th::sel())
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Span::styled(format!(" {label} "), dim())
-        }
-    };
-    let mut head = vec![
-        tab(
-            Tab::Sessions,
-            format!("Sessions {}/{}", app.shown.len(), app.sessions.len()),
-        ),
-        tab(Tab::Tasks, format!("Tasks {}", app.task_shown.len())),
-        tab(Tab::Prs, format!("PRs {}", app.pr_shown.len())),
-        Span::raw("  "),
-    ];
-    if let (Some(c), true) = (&app.ctx, app.here_first) {
-        head.push(Span::styled(
-            format!("● {} ", c.label()),
-            Style::new().fg(th::green()),
-        ));
-    }
-    if app.hide_quick {
-        head.push(Span::styled(
-            "[quick hidden] ",
-            Style::new().fg(th::amber()),
-        ));
-    }
-    if app.deep {
-        head.push(Span::styled("[full-text] ", Style::new().fg(th::amber())));
-    }
-    head.push(Span::styled(
-        "› ",
-        Style::new().fg(th::accent()).add_modifier(Modifier::BOLD),
-    ));
-    head.push(Span::raw(app.query.clone()));
-    head.push(Span::styled("█", Style::new().fg(th::accent())));
-    if app.query.is_empty() {
-        head.push(Span::styled(
-            " search · #123 · p: b: f: @today has:pr",
-            dim(),
-        ));
-    }
-    f.render_widget(Paragraph::new(Line::from(head)), top);
-
-    let wide = main.width >= 110;
-    let [left, right] = if wide {
-        Layout::horizontal([Constraint::Percentage(48), Constraint::Percentage(52)]).areas(main)
+    let wide = main.width >= 100;
+    let lw = if wide {
+        (main.width * 40 / 100).clamp(38, 64)
     } else {
-        let [a, b] =
-            Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(main);
-        [a, b]
+        main.width
     };
-
+    view::header(f, app, top, if wide { lw } else { 0 });
     if app.viewer.is_some() {
         draw_viewer(f, app, main, bottom);
         return;
     }
+    let (left, right) = if wide {
+        let [l, d, r] = Layout::horizontal([
+            Constraint::Length(lw),
+            Constraint::Length(1),
+            Constraint::Min(10),
+        ])
+        .areas(main);
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "│",
+                    Style::new().fg(th::faint())
+                ));
+                d.height as usize
+            ]),
+            d,
+        );
+        (l, r)
+    } else {
+        let [l, r] =
+            Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(main);
+        (l, r)
+    };
     f.render_widget(Block::new().style(Style::new().bg(th::panel())), right);
     match app.tab {
         Tab::Sessions => {
-            draw_session_list(f, app, left);
-            draw_session_preview(f, app, right);
+            view::session_list(f, app, left);
+            view::session_card(f, app, right);
         }
         Tab::Tasks => {
-            draw_task_list(f, app, left);
-            draw_task_preview(f, app, right);
+            view::task_list(f, app, left);
+            view::task_card(f, app, right);
         }
         Tab::Prs => {
-            draw_pr_list(f, app, left);
-            draw_pr_preview(f, app, right);
+            view::pr_list(f, app, left);
+            view::pr_card(f, app, right);
         }
     }
-
     if app.menu {
         draw_menu(f, app, main);
     }
     if app.editor_pick.is_some() {
         draw_editor_pick(f, app, main);
     }
-    let help = if let Some((kind, text)) = &app.input {
-        let (label, hint) = match kind {
-            InputKind::Note { .. } => (
-                "Note: ".to_string(),
-                "   enter save · esc cancel · empty clears",
-            ),
-            InputKind::TicketLink { prefix, .. } => (
-                format!("Link for {prefix} tickets (Jira/Linear address or any ticket URL): "),
-                "   enter save & open · esc cancel",
-            ),
-        };
-        Line::from(vec![
-            Span::styled(
-                label,
-                Style::new().fg(th::amber()).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(text.clone()),
-            Span::styled("█", Style::new().fg(th::amber())),
-            Span::styled(hint, dim()),
-        ])
-    } else if !app.status.is_empty() {
-        Line::from(Span::styled(
-            app.status.clone(),
-            Style::new().fg(th::amber()),
-        ))
-    } else {
-        let k = |key: &'static str, what: &'static str| {
-            vec![
-                Span::styled(key, Style::new().fg(th::accent())),
-                Span::styled(format!(" {what}  "), dim()),
-            ]
-        };
-        let mut v = Vec::new();
-        match app.tab {
-            Tab::Sessions => v.extend(k("enter", "resume")),
-            Tab::Tasks | Tab::Prs => v.extend(k("enter", "sessions")),
-        }
-        v.extend(k("^a", "actions"));
-        v.extend(k("^v", "read"));
-        v.extend(k("^b", "PR"));
-        v.extend(k("^k", "ticket"));
-        v.extend(k("^s", "pin"));
-        v.extend(k("tab", "view"));
-        v.extend(k("^g", "here/all"));
-        v.extend(k("^t", "quick"));
-        v.extend(k("^f", "full-text"));
-        v.extend(k("esc", "quit"));
-        Line::from(v)
-    };
-    f.render_widget(Paragraph::new(help), bottom);
+    if app.help {
+        view::help(f, main);
+    }
+    view::footer(f, app, bottom);
 }
 
 fn draw_menu(f: &mut Frame, app: &App, area: Rect) {
@@ -1398,644 +1332,4 @@ fn draw_viewer(f: &mut Frame, app: &mut App, main: Rect, bottom: Rect) {
         Line::from(x)
     };
     f.render_widget(Paragraph::new(help), bottom);
-}
-
-fn pr_badges(s: &SessionRow, max: usize) -> Vec<Span<'static>> {
-    let mut v = Vec::new();
-    let mut seen = Vec::new();
-    for l in s.prs.iter().filter(|l| l.role.is_significant()) {
-        if seen.contains(&l.number) {
-            continue;
-        }
-        seen.push(l.number);
-        if seen.len() > max {
-            v.push(Span::styled("…", dim()));
-            break;
-        }
-        v.push(Span::styled(
-            format!(" {}#{}", l.role.icon(), l.number),
-            Style::new().fg(role_color(l.role)),
-        ));
-    }
-    v
-}
-
-fn draw_session_list(f: &mut Frame, app: &mut App, area: Rect) {
-    let width = area.width.saturating_sub(4) as usize;
-    let items: Vec<ListItem> = app
-        .shown
-        .iter()
-        .map(|&i| {
-            let s = &app.sessions[i];
-            let tier = if app.here_first {
-                app.corpus.tier[i]
-            } else {
-                0
-            };
-            let task = app.corpus.task_of[i].map(|t| app.tasks[t].sessions.len());
-            let a = format!("{:>4} ", age(s.ended.as_deref().or(s.started.as_deref())));
-            let mut l1 = vec![Span::styled(a, dim())];
-            let title_style = if s.missing { dim() } else { BOLD };
-            if s.pinned {
-                l1.push(Span::styled("↑ ", Style::new().fg(th::amber())));
-            }
-            l1.push(Span::styled(
-                truncate(&s.title(), width.saturating_sub(6)),
-                title_style,
-            ));
-            let here = match tier {
-                crate::context::TIER_BRANCH => Span::styled("   ● ", Style::new().fg(th::green())),
-                crate::context::TIER_PLACE => Span::styled("   ○ ", Style::new().fg(th::green())),
-                _ => Span::raw("     "),
-            };
-            let mut l2 = vec![
-                here,
-                Span::styled(s.project_name(), Style::new().fg(th::project())),
-            ];
-            if let Some(b) = &s.branch {
-                l2.push(Span::styled(format!(" · {}", truncate(b, 28)), dim()));
-            }
-            if let Some(pct) = s.context_pct() {
-                l2.push(Span::styled(
-                    format!("  {pct}%"),
-                    Style::new().fg(ctx_color(pct)),
-                ));
-            }
-            if s.cloud_id.is_some() || s.entrypoint.as_deref() == Some("remote") {
-                l2.push(Span::styled("  cloud", dim()));
-            }
-            if s.missing {
-                l2.push(Span::styled(
-                    " (transcript deleted)",
-                    Style::new().fg(th::red()),
-                ));
-            }
-            l2.extend(pr_badges(s, 4));
-            if let Some(t) = s.tickets.first() {
-                l2.push(Span::styled(format!("  {t}"), Style::new().fg(th::teal())));
-            }
-            if s.note.is_some() {
-                l2.push(Span::styled("  ≡", Style::new().fg(th::amber())));
-            }
-            if s.hidden {
-                l2.push(Span::styled(" (hidden)", dim()));
-            }
-            if let Some(n) = task {
-                l2.push(Span::styled(format!("  ×{n}"), dim()));
-            }
-            ListItem::new(Text::from(vec![Line::from(l1), Line::from(l2)]))
-        })
-        .collect();
-    let list = List::new(items)
-        .block(
-            Block::new()
-                .borders(Borders::RIGHT)
-                .border_style(Style::new().fg(th::faint())),
-        )
-        .highlight_style(Style::new().bg(th::sel()))
-        .highlight_symbol("▌")
-        .highlight_spacing(HighlightSpacing::Always);
-    f.render_stateful_widget(list, area, &mut app.list);
-}
-
-fn wrap_lines(label: &str, body: &str, style: Style) -> Vec<Line<'static>> {
-    let mut out = vec![Line::from(Span::styled(
-        label.to_string(),
-        Style::new().fg(th::accent()).add_modifier(Modifier::BOLD),
-    ))];
-    for l in body.lines() {
-        out.push(Line::from(Span::styled(l.to_string(), style)));
-    }
-    out
-}
-
-fn actor_name(app: &App, a: &Actor) -> String {
-    match a {
-        Actor::Local(i) => {
-            let s = &app.sessions[*i];
-            format!("{} \"{}\"", s.short_id(), truncate(&s.title(), 36))
-        }
-        Actor::Cloud(c) => format!("cloud session {}", truncate(c, 20)),
-    }
-}
-
-fn draw_session_preview(f: &mut Frame, app: &App, area: Rect) {
-    let Some(s) = app.selected() else {
-        f.render_widget(
-            Paragraph::new(Span::styled("  No matching sessions.", dim())),
-            area,
-        );
-        return;
-    };
-    let me = app.shown[app.list.selected().unwrap_or(0)];
-    let mut lines: Vec<Line> = vec![
-        Line::from(Span::styled(s.title(), BOLD.fg(th::bright()))),
-        Line::from(vec![
-            Span::styled(home_short(&s.resume_dir()), Style::new().fg(th::project())),
-            Span::styled(
-                s.branch
-                    .as_ref()
-                    .map(|b| format!(" · {b}"))
-                    .unwrap_or_default(),
-                dim(),
-            ),
-        ]),
-    ];
-    let mut meta = format!(
-        "{} · {} prompt{}",
-        local_time(s.started.as_deref()),
-        s.user_prompts,
-        if s.user_prompts == 1 { "" } else { "s" }
-    );
-    if let Some(d) = duration(s.started.as_deref(), s.ended.as_deref()) {
-        meta.push_str(&format!(" · {d}"));
-    }
-    if s.cost_usd > 0.0 {
-        meta.push_str(&format!(" · ${:.2}", s.cost_usd));
-    }
-    if let Some(m) = &s.model {
-        meta.push_str(&format!(" · {m}"));
-    }
-    lines.push(Line::from(Span::styled(meta, dim())));
-    if let (Some(c), Some(pct)) = (s.context_summary(), s.context_pct()) {
-        let hint = if pct >= 80 {
-            "  — nearly full: consider a fresh session"
-        } else {
-            ""
-        };
-        lines.push(Line::from(vec![
-            Span::styled(c.to_string(), Style::new().fg(ctx_color(pct))),
-            Span::styled(hint, dim()),
-        ]));
-    }
-    lines.push(Line::from(Span::styled(format!("id {}", s.id), dim())));
-    if let Some(n) = &s.note {
-        lines.push(Line::from(vec![
-            Span::styled("note: ", Style::new().fg(th::amber())),
-            Span::styled(n.clone(), Style::new().fg(th::amber())),
-        ]));
-    }
-    for t in &s.tickets {
-        let url =
-            crate::config::ticket_url(t).unwrap_or_else(|| "(press ^k to set its link)".into());
-        lines.push(Line::from(vec![
-            Span::styled(format!("{t}  "), Style::new().fg(th::teal())),
-            Span::styled(url, dim()),
-        ]));
-    }
-    if let Some(c) = &s.cloud_id {
-        lines.push(Line::from(Span::styled(
-            format!("cloud: https://claude.ai/code/{c}"),
-            dim(),
-        )));
-    }
-    lines.push(Line::raw(""));
-    let label = if s.ai_desc.is_some() {
-        "Description (AI)"
-    } else {
-        "Description"
-    };
-    lines.extend(wrap_lines(label, s.description(), Style::new()));
-
-    if let Some(t) = app.corpus.task_of[me].map(|t| &app.tasks[t]) {
-        lines.push(Line::raw(""));
-        lines.push(Line::from(vec![
-            Span::styled(
-                "Part of task ",
-                Style::new().fg(th::accent()).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(truncate(&t.title, 50), BOLD),
-            Span::styled(format!("  ({} sessions)", t.sessions.len()), dim()),
-        ]));
-        for &i in t.sessions.iter().filter(|&&i| i != me).take(4) {
-            let o = &app.sessions[i];
-            let when = if i < me { "later  " } else { "earlier" };
-            lines.push(Line::from(vec![
-                Span::styled(format!(" {when} "), dim()),
-                Span::styled(format!("{} ", o.short_id()), Style::new().fg(th::project())),
-                Span::styled(format!("{:>4} ", age(o.ended.as_deref())), dim()),
-                Span::raw(truncate(&o.title(), 48)),
-            ]));
-        }
-    }
-    let sig = s.pr_summary();
-    if !sig.is_empty() {
-        lines.push(Line::raw(""));
-        lines.push(Line::from(Span::styled(
-            "Pull requests",
-            Style::new().fg(th::accent()).add_modifier(Modifier::BOLD),
-        )));
-        for (l, also) in sig {
-            let key = if l.repo.is_empty() {
-                format!("#{}", l.number)
-            } else {
-                format!("{}#{}", l.repo, l.number)
-            };
-            let entry = app
-                .pr_by_key
-                .get(&(l.repo.clone(), l.number))
-                .map(|&i| &app.prs[i]);
-            let title = entry
-                .and_then(|e| e.title())
-                .map(|t| format!(" {}", truncate(t, 40)))
-                .unwrap_or_default();
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!(" {} {:<9} ", l.role.icon(), l.role.verb()),
-                    Style::new()
-                        .fg(role_color(l.role))
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(key),
-                Span::styled(title, dim()),
-                Span::styled(
-                    if also.is_empty() {
-                        String::new()
-                    } else {
-                        format!(
-                            "  (also {})",
-                            also.iter()
-                                .map(|r| r.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        )
-                    },
-                    dim(),
-                ),
-            ]));
-            // Cross-session context: who else created / reviewed this PR.
-            if let Some(e) = entry {
-                for (role, actors) in [
-                    (Role::Created, e.creators()),
-                    (Role::Reviewed, e.reviewers()),
-                ] {
-                    let others: Vec<String> = actors
-                        .iter()
-                        .filter(|a| **a != Actor::Local(me))
-                        .map(|a| actor_name(app, a))
-                        .collect();
-                    if !others.is_empty() {
-                        lines.push(Line::from(vec![
-                            Span::raw("     └ "),
-                            Span::styled(
-                                format!("{} in another session: ", role.as_str()),
-                                Style::new().fg(role_color(role)),
-                            ),
-                            Span::raw(others.join(", ")),
-                        ]));
-                    }
-                }
-            }
-        }
-    }
-    if !s.files_edited.is_empty() {
-        lines.push(Line::raw(""));
-        let files: Vec<&str> = s.files_edited.iter().take(12).map(String::as_str).collect();
-        let more = s.files_edited.len().saturating_sub(12);
-        let body = files.join("\n")
-            + &if more > 0 {
-                format!("\n… +{more} more")
-            } else {
-                String::new()
-            };
-        lines.extend(wrap_lines(
-            &format!("Files edited ({})", s.files_edited.len()),
-            &body,
-            dim(),
-        ));
-    }
-    if let Some(lp) = s
-        .last_prompt
-        .as_ref()
-        .filter(|lp| s.user_prompts > 1 && Some(*lp) != s.first_prompt.as_ref())
-    {
-        lines.push(Line::raw(""));
-        lines.extend(wrap_lines("Last prompt", &truncate(lp, 600), Style::new()));
-    }
-    f.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((app.preview_scroll, 0))
-            .block(Block::new().borders(Borders::NONE)),
-        pad(area),
-    );
-}
-
-fn pad(a: Rect) -> Rect {
-    Rect {
-        x: a.x + 1,
-        y: a.y,
-        width: a.width.saturating_sub(2),
-        height: a.height,
-    }
-}
-
-fn draw_pr_list(f: &mut Frame, app: &mut App, area: Rect) {
-    let width = area.width.saturating_sub(4) as usize;
-    let items: Vec<ListItem> = app
-        .pr_shown
-        .iter()
-        .map(|&i| {
-            let p = &app.prs[i];
-            let mut l1 = vec![];
-            if p.born_from_claude() {
-                l1.push(Span::styled("● ", Style::new().fg(th::green())));
-            } else {
-                l1.push(Span::styled("○ ", dim()));
-            }
-            l1.push(Span::styled(p.key(), BOLD));
-            if let Some(st) = p.state() {
-                let c = match st {
-                    "open" => th::green(),
-                    "merged" => th::purple(),
-                    _ => th::red(),
-                };
-                l1.push(Span::styled(format!(" [{st}]"), Style::new().fg(c)));
-            }
-            if let Some(t) = p.title() {
-                l1.push(Span::raw(format!(
-                    " {}",
-                    truncate(t, width.saturating_sub(p.key().len() + 12))
-                )));
-            }
-            let story = truncate(&p.story(&app.sessions), width.saturating_sub(4));
-            ListItem::new(Text::from(vec![
-                Line::from(l1),
-                Line::from(Span::styled(format!("  {story}"), dim())),
-            ]))
-        })
-        .collect();
-    let list = List::new(items)
-        .block(
-            Block::new()
-                .borders(Borders::RIGHT)
-                .border_style(Style::new().fg(th::faint())),
-        )
-        .highlight_style(Style::new().bg(th::sel()))
-        .highlight_symbol("▌")
-        .highlight_spacing(HighlightSpacing::Always);
-    f.render_stateful_widget(list, area, &mut app.pr_list);
-}
-
-fn draw_pr_preview(f: &mut Frame, app: &App, area: Rect) {
-    let Some(p) = app.selected_pr() else {
-        let msg = if app.prs.is_empty() {
-            "  No PRs found in your sessions yet.\n  Run `cctrail sync` to pull PR titles/state from GitHub."
-        } else {
-            "  No matching PRs."
-        };
-        f.render_widget(Paragraph::new(Text::styled(msg, dim())), area);
-        return;
-    };
-    let mut lines = vec![Line::from(vec![
-        Span::styled(p.key(), BOLD.fg(th::bright())),
-        Span::styled(
-            p.state().map(|s| format!("  [{s}]")).unwrap_or_default(),
-            dim(),
-        ),
-    ])];
-    if let Some(t) = p.title() {
-        lines.push(Line::from(Span::styled(t.to_string(), BOLD)));
-    }
-    if let Some(u) = pr_url(p) {
-        lines.push(Line::from(Span::styled(u, dim())));
-    }
-    if p.meta.is_none() {
-        lines.push(Line::from(Span::styled(
-            "(no GitHub metadata — `cctrail sync` fetches title/state)",
-            dim(),
-        )));
-    }
-    lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled(
-        p.story(&app.sessions),
-        Style::new().fg(th::amber()),
-    )));
-    lines.push(Line::raw(""));
-    for (l, also) in p.grouped() {
-        let also = if also.is_empty() {
-            String::new()
-        } else {
-            format!(
-                " (also {})",
-                also.iter()
-                    .map(|r| r.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        };
-        let (who, when, title) = match l.session {
-            Some(i) => {
-                let s = &app.sessions[i];
-                (
-                    s.short_id().to_string(),
-                    local_time(l.ts.as_deref().or(s.started.as_deref())),
-                    s.title(),
-                )
-            }
-            None => (
-                "cloud".into(),
-                local_time(l.ts.as_deref()),
-                l.cloud_id
-                    .as_ref()
-                    .map(|c| format!("https://claude.ai/code/{c}"))
-                    .unwrap_or_default(),
-            ),
-        };
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{} {:<9} ", l.role.icon(), l.role.verb()),
-                Style::new()
-                    .fg(role_color(l.role))
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!("{who}  "), Style::new().fg(th::project())),
-            Span::styled(format!("{when}  "), dim()),
-            Span::raw(truncate(&title, 50)),
-        ]));
-        lines.push(Line::from(Span::styled(
-            format!("             {}{also}", l.evidence),
-            dim(),
-        )));
-    }
-    f.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((app.preview_scroll, 0)),
-        pad(area),
-    );
-}
-
-fn draw_task_list(f: &mut Frame, app: &mut App, area: Rect) {
-    let width = area.width.saturating_sub(4) as usize;
-    let items: Vec<ListItem> = app
-        .task_shown
-        .iter()
-        .map(|&ti| {
-            let t = &app.tasks[ti];
-            let newest = &app.sessions[t.sessions[0]];
-            let l1 = vec![
-                Span::styled(format!("{:>4} ", age(newest.ended.as_deref())), dim()),
-                Span::styled(truncate(&t.title, width.saturating_sub(6)), BOLD),
-            ];
-            let here = t
-                .sessions
-                .iter()
-                .map(|&i| app.corpus.tier[i])
-                .max()
-                .unwrap_or(0);
-            let mut l2 = vec![
-                Span::styled(
-                    if app.here_first && here > 0 {
-                        "   ● "
-                    } else {
-                        "     "
-                    },
-                    Style::new().fg(th::green()),
-                ),
-                Span::styled(t.project.clone(), Style::new().fg(th::project())),
-            ];
-            if let Some(b) = &t.branch {
-                l2.push(Span::styled(format!(" · {}", truncate(b, 26)), dim()));
-            }
-            l2.push(Span::styled(
-                format!(" · {} sessions", t.sessions.len()),
-                Style::new().fg(th::amber()),
-            ));
-            if t.cost_usd > 0.0 {
-                l2.push(Span::styled(format!(" · ${:.2}", t.cost_usd), dim()));
-            }
-            if let Some(k) = t.tickets.first() {
-                l2.push(Span::styled(format!("  {k}"), Style::new().fg(th::teal())));
-            }
-            for &pi in t.prs.iter().take(3) {
-                let p = &app.prs[pi];
-                let role = p
-                    .links
-                    .iter()
-                    .filter(|l| l.session.is_some_and(|i| t.sessions.contains(&i)))
-                    .map(|l| l.role)
-                    .min();
-                if let Some(r) = role {
-                    l2.push(Span::styled(
-                        format!(" {}#{}", r.icon(), p.number),
-                        Style::new().fg(role_color(r)),
-                    ));
-                }
-            }
-            ListItem::new(Text::from(vec![Line::from(l1), Line::from(l2)]))
-        })
-        .collect();
-    let list = List::new(items)
-        .block(
-            Block::new()
-                .borders(Borders::RIGHT)
-                .border_style(Style::new().fg(th::faint())),
-        )
-        .highlight_style(Style::new().bg(th::sel()))
-        .highlight_symbol("▌")
-        .highlight_spacing(HighlightSpacing::Always);
-    f.render_stateful_widget(list, area, &mut app.task_list);
-}
-
-fn draw_task_preview(f: &mut Frame, app: &App, area: Rect) {
-    let Some(t) = app.selected_task() else {
-        let msg = if app.tasks.is_empty() {
-            "  No tasks yet. Sessions are grouped into a task when they work on\n  the same branch or the same PR."
-        } else {
-            "  No matching tasks."
-        };
-        f.render_widget(Paragraph::new(Text::styled(msg, dim())), area);
-        return;
-    };
-    let mut lines = vec![
-        Line::from(Span::styled(t.title.clone(), BOLD.fg(th::bright()))),
-        Line::from(vec![
-            Span::styled(t.project.clone(), Style::new().fg(th::project())),
-            Span::styled(
-                t.branch
-                    .as_ref()
-                    .map(|b| format!(" · {b}"))
-                    .unwrap_or_default(),
-                dim(),
-            ),
-            Span::styled(
-                if t.cost_usd > 0.0 {
-                    format!("  · ${:.2} total", t.cost_usd)
-                } else {
-                    String::new()
-                },
-                dim(),
-            ),
-        ]),
-    ];
-    for k in &t.tickets {
-        let url = crate::config::ticket_url(k).unwrap_or_default();
-        lines.push(Line::from(vec![
-            Span::styled(format!("{k}  "), Style::new().fg(th::teal())),
-            Span::styled(url, dim()),
-        ]));
-    }
-    for &pi in &t.prs {
-        let p = &app.prs[pi];
-        lines.push(Line::from(vec![
-            Span::styled(format!("{} ", p.key()), BOLD),
-            Span::styled(
-                p.state().map(|s| format!("[{s}] ")).unwrap_or_default(),
-                dim(),
-            ),
-            Span::styled(p.story(&app.sessions), Style::new().fg(th::amber())),
-        ]));
-    }
-    lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled(
-        format!("Sessions ({}), oldest first", t.sessions.len()),
-        Style::new().fg(th::accent()).add_modifier(Modifier::BOLD),
-    )));
-    for &i in t.sessions.iter().rev() {
-        let s = &app.sessions[i];
-        let roles: Vec<Span> = t
-            .prs
-            .iter()
-            .filter_map(|&pi| {
-                let p = &app.prs[pi];
-                let r = p
-                    .links
-                    .iter()
-                    .filter(|l| l.session == Some(i))
-                    .map(|l| l.role)
-                    .min()?;
-                r.is_significant().then(|| {
-                    Span::styled(
-                        format!(" {} {} #{}", r.icon(), r.as_str(), p.number),
-                        Style::new().fg(role_color(r)),
-                    )
-                })
-            })
-            .collect();
-        let mut l = vec![
-            Span::styled(format!("{} ", s.short_id()), Style::new().fg(th::project())),
-            Span::styled(format!("{}  ", local_time(s.started.as_deref())), dim()),
-            Span::raw(truncate(&s.title(), 50)),
-        ];
-        l.extend(roles);
-        lines.push(Line::from(l));
-        if let Some(d) = s.description().lines().find(|l| !l.starts_with("Asked:")) {
-            lines.push(Line::from(Span::styled(
-                format!("          {}", truncate(d, 80)),
-                dim(),
-            )));
-        }
-    }
-    lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled(
-        "Enter lists these sessions; the newest is selected.",
-        dim(),
-    )));
-    f.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((app.preview_scroll, 0)),
-        pad(area),
-    );
 }
