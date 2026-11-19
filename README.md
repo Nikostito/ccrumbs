@@ -5,6 +5,10 @@ Find a Claude Code session in seconds, see what it did and which PRs it
 
 ![cctrail: session list with descriptions and PR badges](docs/sessions.png)
 
+The list is short and grouped (Pinned, Here, Today, Yesterday, This week…);
+the right side is a card with the facts, what happened, the PR and who did
+what, and other sessions in the same task.
+
 Type a few words (or `#123` for a PR), press **Enter**, and you're back in
 that session: cctrail `cd`s into its directory and runs
 `claude --resume <id>` for you. Started inside a repo, it puts that repo's
@@ -145,9 +149,10 @@ created it first:
 
 ![Searching #88 in the picker](docs/search-pr.png)
 
-Plain words match titles, projects, branches, descriptions and prompts:
+Plain words match titles, projects, branches, descriptions and prompts.
+Press `?` (with an empty search) for every key and filter:
 
-![Searching "leak" in the picker](docs/search-text.png)
+![Keys and filters](docs/help.png)
 
 | Key | Action |
 |---|---|
@@ -174,6 +179,7 @@ Plain words match titles, projects, branches, descriptions and prompts:
 | `Ctrl-B` | open the session's PR in your browser (else its claude.ai page) |
 | `Ctrl-R` | re-index |
 | `←` / `→` | scroll the preview |
+| `?` | keys and filters (when the search box is empty) |
 | `Esc` | clear the query, or quit |
 
 ## AI descriptions
