@@ -2,10 +2,17 @@
 name = "ccrumbs"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89"
 description = "Find, understand and resume your Claude Code sessions, and see which PRs they created or reviewed"
+authors = ["Nikos"]
 license = "MIT"
 readme = "README.md"
-rust-version = "1.85"
+repository = "https://github.com/nikostito/ccrumbs"
+homepage = "https://github.com/nikostito/ccrumbs"
+keywords = ["claude-code", "claude", "sessions", "tui", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+# Screenshots and CI config aren't needed to build; README images use absolute URLs.
+exclude = ["docs/", ".github/", "target/"]
 
 [dependencies]
 anyhow = "1.0.104"

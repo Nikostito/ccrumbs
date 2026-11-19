@@ -155,12 +155,11 @@ fn wrap(s: &str, width: usize) -> Vec<String> {
             if end == start {
                 end = start + 1; // a single char wider than the line
             }
-            if end < chars.len() {
-                if let Some(sp) = chars[start..end].iter().rposition(|c| *c == ' ') {
-                    if sp > (end - start) / 3 {
-                        end = start + sp + 1;
-                    }
-                }
+            if end < chars.len()
+                && let Some(sp) = chars[start..end].iter().rposition(|c| *c == ' ')
+                && sp > (end - start) / 3
+            {
+                end = start + sp + 1;
             }
             out.push(
                 chars[start..end]
@@ -993,10 +992,10 @@ fn on_key(app: &mut App, k: KeyEvent, db: &mut Db, cfg: &Config) -> Result<Step>
     }
     if app.menu {
         app.menu = false;
-        if let KeyCode::Char(c) = k.code {
-            if let Some((_, a, _)) = MENU.iter().find(|(key, _, _)| *key == c) {
-                return do_action(app, *a, db, cfg);
-            }
+        if let KeyCode::Char(c) = k.code
+            && let Some((_, a, _)) = MENU.iter().find(|(key, _, _)| *key == c)
+        {
+            return do_action(app, *a, db, cfg);
         }
         return Ok(Step::Stay);
     }

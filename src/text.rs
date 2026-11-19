@@ -251,10 +251,10 @@ pub fn tokens(n: u64) -> String {
 pub fn home_short(path: &str) -> String {
     if let Some(home) = dirs::home_dir() {
         let h = home.to_string_lossy();
-        if let Some(rest) = path.strip_prefix(h.as_ref()) {
-            if rest.is_empty() || rest.starts_with(['/', '\\']) {
-                return format!("~{rest}");
-            }
+        if let Some(rest) = path.strip_prefix(h.as_ref())
+            && (rest.is_empty() || rest.starts_with(['/', '\\']))
+        {
+            return format!("~{rest}");
         }
     }
     path.to_string()

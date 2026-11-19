@@ -289,10 +289,10 @@ pub fn passes(s: &SessionRow, task: Option<usize>, q: &Query) -> bool {
         .as_deref()
         .or(s.started.as_deref())
         .and_then(crate::text::parse_ts);
-    if let Some(since) = q.since {
-        if last.is_none_or(|t| t < since) {
-            return false;
-        }
+    if let Some(since) = q.since
+        && last.is_none_or(|t| t < since)
+    {
+        return false;
     }
     if let Some(until) = q.until {
         let first = s.started.as_deref().and_then(crate::text::parse_ts);

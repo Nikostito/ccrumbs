@@ -410,13 +410,12 @@ pub fn from_bash(cmd: &str) -> Vec<Pending> {
         let (pos, repo_flag) = positionals(&words);
         let mut repo = repo_flag;
         let mut number = None;
-        if !matches!(sub, "create" | "new") {
-            if let Some(first) = pos.first() {
-                if let Some((r, n)) = parse_ref(first) {
-                    repo = repo.or(r);
-                    number = Some(n);
-                }
-            }
+        if !matches!(sub, "create" | "new")
+            && let Some(first) = pos.first()
+            && let Some((r, n)) = parse_ref(first)
+        {
+            repo = repo.or(r);
+            number = Some(n);
         }
         let role = match sub {
             "create" | "new" => Role::Created,
@@ -535,12 +534,12 @@ static ISSUE_URL: LazyLock<Regex> = LazyLock::new(|| {
 pub fn complete(mut p: Pending, result: &str) -> Option<Pending> {
     // Commenting on an issue (not a PR) shares the tools and numbering; the result
     // URL tells them apart.
-    if urls_in(result).is_empty() {
-        if let Some(c) = ISSUE_URL.captures(result) {
-            let n: Option<u32> = c[1].parse().ok();
-            if p.number.is_none() || p.number == n {
-                return None;
-            }
+    if urls_in(result).is_empty()
+        && let Some(c) = ISSUE_URL.captures(result)
+    {
+        let n: Option<u32> = c[1].parse().ok();
+        if p.number.is_none() || p.number == n {
+            return None;
         }
     }
     if p.number.is_none() || p.role == Role::Created {

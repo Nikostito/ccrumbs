@@ -72,19 +72,19 @@ fn which(bin: &str) -> bool {
 
 /// A command for `bin`. On Windows, `.cmd`/`.bat` files have to go through cmd.exe.
 fn program(bin: &str) -> Command {
-    if cfg!(windows) {
-        if let Some(p) = find(bin) {
-            let ext = p
-                .extension()
-                .map(|e| e.to_string_lossy().to_lowercase())
-                .unwrap_or_default();
-            if ext == "cmd" || ext == "bat" {
-                let mut c = Command::new("cmd");
-                c.arg("/c").arg(p);
-                return c;
-            }
-            return Command::new(p);
+    if cfg!(windows)
+        && let Some(p) = find(bin)
+    {
+        let ext = p
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if ext == "cmd" || ext == "bat" {
+            let mut c = Command::new("cmd");
+            c.arg("/c").arg(p);
+            return c;
         }
+        return Command::new(p);
     }
     Command::new(bin)
 }
@@ -272,8 +272,8 @@ pub fn open_tab(s: &SessionRow) -> Result<String> {
                 .is_ok())
         .then(|| format!("opened a new {bin} tab"))
     };
-    if env("GNOME_TERMINAL_SCREEN") || env("GNOME_TERMINAL_SERVICE") {
-        if let Some(m) = tab_in(
+    if (env("GNOME_TERMINAL_SCREEN") || env("GNOME_TERMINAL_SERVICE"))
+        && let Some(m) = tab_in(
             "gnome-terminal",
             vec![
                 "--tab",
@@ -284,12 +284,12 @@ pub fn open_tab(s: &SessionRow) -> Result<String> {
                 "-c",
                 &keep_shell,
             ],
-        ) {
-            return Ok(m);
-        }
+        )
+    {
+        return Ok(m);
     }
-    if env("KONSOLE_VERSION") {
-        if let Some(m) = tab_in(
+    if env("KONSOLE_VERSION")
+        && let Some(m) = tab_in(
             "konsole",
             vec![
                 "--new-tab",
@@ -300,12 +300,12 @@ pub fn open_tab(s: &SessionRow) -> Result<String> {
                 "-c",
                 &keep_shell,
             ],
-        ) {
-            return Ok(m);
-        }
+        )
+    {
+        return Ok(m);
     }
-    if term == "xfce4-terminal" || env("XFCE_TERMINAL") {
-        if let Some(m) = tab_in(
+    if (term == "xfce4-terminal" || env("XFCE_TERMINAL"))
+        && let Some(m) = tab_in(
             "xfce4-terminal",
             vec![
                 "--tab",
@@ -316,9 +316,9 @@ pub fn open_tab(s: &SessionRow) -> Result<String> {
                 "-c",
                 &keep_shell,
             ],
-        ) {
-            return Ok(m);
-        }
+        )
+    {
+        return Ok(m);
     }
     bail!(
         "this terminal has no way to open a tab from outside; use ^y to copy the command (tabs work in tmux, zellij, WezTerm, kitty, iTerm2, Terminal, Ghostty, Warp, GNOME Terminal, Konsole, Windows Terminal)"
@@ -448,10 +448,10 @@ pub fn detect_editors() -> Vec<Editor> {
         }
     }
     for var in ["VISUAL", "EDITOR"] {
-        if let Ok(v) = std::env::var(var) {
-            if !v.trim().is_empty() {
-                add(&format!("${var} ({v})"), v);
-            }
+        if let Ok(v) = std::env::var(var)
+            && !v.trim().is_empty()
+        {
+            add(&format!("${var} ({v})"), v);
         }
     }
     out

@@ -82,27 +82,26 @@ fn grouped_list(
     let h = area.height as usize;
     let w = area.width as usize;
     // Keep the selection visible, showing its heading when scrolling up.
-    if let Some(sel) = selected {
-        if let Some(pos) = rows
+    if let Some(sel) = selected
+        && let Some(pos) = rows
             .iter()
             .position(|r| matches!(r, Row::Item(i) if *i == sel))
-        {
-            let want_top = if pos >= 1 && matches!(rows[pos - 1], Row::Head(..)) {
-                pos - 1
-            } else {
-                pos
-            };
-            if want_top < *offset {
-                *offset = want_top.saturating_sub(
-                    if want_top >= 1 && matches!(rows[want_top - 1], Row::Gap) {
-                        1
-                    } else {
-                        0
-                    },
-                );
-            } else if pos >= *offset + h {
-                *offset = pos + 1 - h;
-            }
+    {
+        let want_top = if pos >= 1 && matches!(rows[pos - 1], Row::Head(..)) {
+            pos - 1
+        } else {
+            pos
+        };
+        if want_top < *offset {
+            *offset = want_top.saturating_sub(
+                if want_top >= 1 && matches!(rows[want_top - 1], Row::Gap) {
+                    1
+                } else {
+                    0
+                },
+            );
+        } else if pos >= *offset + h {
+            *offset = pos + 1 - h;
         }
     }
     *offset = (*offset).min(rows.len().saturating_sub(1));
