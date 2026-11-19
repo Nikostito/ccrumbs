@@ -1,371 +1,310 @@
-# cctrail — Claude Code Session Tracker
+# cctrail
 
-A CLI tool that indexes your local Claude Code session transcripts
-(`~/.claude/projects/**/*.jsonl`) into a searchable SQLite database, so you
-can find, read, and analyze past sessions without hunting through raw
-JSONL files — plus a lazygit-style interactive TUI.
+Find a Claude Code session in seconds, see what it did and which PRs it
+**created** or **reviewed**, and jump straight back into it.
+
+![cctrail: session list with descriptions and PR badges](docs/sessions.png)
+
+Type a few words (or `#123` for a PR), press **Enter**, and you're back in
+that session: cctrail `cd`s into its directory and runs
+`claude --resume <id>` for you. Started inside a repo, it puts that repo's
+sessions first (◉ same branch, ○ same repo). Inside a repo, plain
+`cctrail go` continues the latest session on your branch.
+
+## What it gives you
+
+- **A description for every session.** Each session gets one for free at
+  index time: what you asked, what followed, which files were edited,
+  whether tests ran, commits, and PRs. `cctrail describe` can also have
+  Claude write a short title and summary (needs `ANTHROPIC_API_KEY`).
+- **PRs born from Claude sessions.** cctrail reads the transcripts for
+  `gh pr create`, `gh pr review/merge/comment`, `gh api …/pulls/…`,
+  GitHub MCP tools (`create_pull_request`, `pull_request_review_write`, …),
+  and prompts like `/review 42` or "review https://github.com/o/r/pull/7".
+  Failed commands and text inside heredocs or quoted strings don't count.
+- **PR lookup by number.** `cctrail pr 42` (or `#42`, `owner/repo#42`, or a
+  PR URL) lists every session that touched the PR and says how.
+- **Created by one session, reviewed by another, stated plainly.** The PRs
+  tab tells each PR's story:
+
+  ![PRs tab: who created and who reviewed each PR](docs/prs-tab.png)
+
+  You'll see one of: *"Created by A · reviewed by a DIFFERENT session: B"*,
+  *"Created and reviewed in the SAME session"*, or *"Reviewed by B · created
+  outside your Claude sessions"*. A session's detail view also says
+  *"↳ created in another session: …"* next to PRs it only reviewed.
+- **Context fill and cost per session.** Each session shows how full its
+  context window was when it ended (◔ green under 50%, yellow under 80%, red
+  above), how many times it was compacted, and what it cost, taken from
+  Claude Code's own cost tally. A session at 87% is close to compacting
+  again, so it's often better to start fresh than to resume it.
+  `ctx:>80` finds those sessions.
+- **Starts where you are.** Run it inside a repo and sessions from your
+  current branch come first, then the rest of that repo, then everything
+  else. `Ctrl-G` switches to plain newest-first.
+- **Tasks: sessions that belong together.** Sessions that worked on the same
+  branch, or on the same PR (created it, reviewed it, addressed the review),
+  are grouped into one task. The Tasks view shows the whole story in order,
+  and each session's preview lists its earlier and later sessions:
+
+  ![Tasks view: three sessions behind one PR](docs/tasks.png)
+
+- **Filters you can type.** `p:api`, `b:feat`, `f:ratelimit.rs` (a file it
+  edited), `repo:acme/web`, `has:pr`, `@today`, `@yesterday`, `@week`,
+  `@3d`, and `#88`, all combinable with plain words. `Ctrl-T` hides one-off
+  quick questions.
+
+  ![Filtering by an edited file](docs/filters.png)
+
+- **Read before you resume.** `Ctrl-V` opens the whole conversation
+  (prompts, replies, tool calls; `o` shows tool output) with `/` search, so
+  you can check it's the right session. Enter resumes it from there.
+
+  ![Reading a session](docs/viewer.png)
+
+- **Jira and Linear tickets.** Keys like `ABC-123` are picked up from branch
+  names (`feature/ABC-123-…`, `nikos/eng-42-…`), prompts and titles. They
+  show as ⚑ badges, are searchable (type `ABC-123`), group sessions into
+  one task, and `Ctrl-K` opens the ticket.
+- **Pins, notes and cleanup.** `Ctrl-S` pins the sessions you're juggling to
+  the top. Notes (`Ctrl-A n`) show in the preview and are searchable.
+  Sessions you'll never need again can be hidden (`Ctrl-A h`).
+- **One menu for everything else.** `Ctrl-A` lists every action for the
+  selection: open its PR, ticket or claude.ai page, open the project in your
+  editor, export as Markdown, describe with Claude, copy the id, and so on.
+
+  ![The actions menu](docs/actions.png)
+
+- **Claude can search your history too.** `cctrail mcp` is an MCP server,
+  so inside a session you can ask *"how did we fix the redis bucket issue
+  last time?"* (see [Use from Claude Code](#use-from-claude-code-mcp)).
+- **Fast.** It's written in Rust: transcripts are parsed in parallel, and
+  only files that changed are re-parsed, on every launch. Measured on 4 cores:
+
+  | History | First index | Launch, nothing changed | Launch, a 14 MB session grew | Commands |
+  |---|---|---|---|---|
+  | 100 realistic sessions, 207 MB | 0.2 s | 1 ms | 33 ms | 7–14 ms |
+  | 2,000 synthetic sessions, 641 MB | ~4 s | 10 ms | | |
 
 ## Install
 
-Requires Python 3.8+.
+You need a Rust toolchain ([rustup.rs](https://rustup.rs)).
 
 ```bash
-git clone <your-repo-url> cctrail
-cd cctrail
-./install.sh            # core CLI only
-./install.sh --tui       # also installs the interactive TUI (pulls in textual)
+cargo install --git https://github.com/nikostito/cctrail --locked
 ```
 
-This installs `cctrail` as a command on your `PATH` (via [pipx](https://pipx.pypa.io)
-if available, falling back to `pip install --user`).
+Or, from a clone, run `cargo install --path . --locked`. That puts a single
+`cctrail` binary in `~/.cargo/bin`.
 
-Prefer to do it by hand?
+## Everyday use
+
+| Command | What it does |
+|---|---|
+| `cctrail` | Open the picker |
+| `cctrail go` | Inside a repo: continue the latest session on this branch (else this repo) |
+| `cctrail go <words / id / #PR / filters>` | Jump straight in when there's exactly one match; otherwise open the picker with that query |
+| `cctrail tasks` | Sessions grouped by task, with each one's role on the task's PRs |
+| `cctrail pr 42` | Who created / reviewed / merged PR 42, then `cctrail go <id>` |
+| `cctrail prs [--claude] [--repo web]` | PRs your sessions created or reviewed; `--claude` keeps only the ones born from a Claude session |
+| `cctrail list [query] [-n 50] [-s]` | Recent sessions with descriptions, e.g. `cctrail list f:auth @week` |
+| `cctrail search <words>` | Full-text search across every prompt, reply and shell command |
+| `cctrail show <id>` | Everything about one session |
+| `cctrail resume <id> [--tab \| --print]` | Resume here, in a new terminal tab, or just print the command |
+| `cctrail view <id> [--outputs]` | Print the conversation (pipe to `less -R`) |
+| `cctrail export <id> [-o file.md \| -o -]` | Summary, PRs, tickets, files and conversation as Markdown |
+| `cctrail open <id \| #PR \| ABC-123> [--pr\|--ticket\|--cloud] [--print]` | Open the session's PR, ticket or claude.ai page |
+| `cctrail pin <id>` / `unpin` · `note <id> [text]` · `hide <id>` / `unhide` | Your own marks; `note <id>` with no text clears it |
+| `cctrail dir <id>` | Print the session's directory: `cd "$(cctrail dir a1b2)"` |
+| `cctrail pick --print-dir` / `--print` | Pick interactively, print the directory / resume command |
+| `cctrail shell-init zsh\|bash\|fish` | Key binding and `ccd` helper (see below) |
+| `cctrail mcp` | MCP server for Claude Code (see below) |
+
+Session ids can be abbreviated to their first few characters, like git
+hashes.
+
+![cctrail pr 88 and cctrail tasks](docs/cli-pr.png)
+
+### Picker keys
+
+Typing `#88` keeps only the sessions linked to that PR, with the one that
+created it first:
+
+![Searching #88 in the picker](docs/search-pr.png)
+
+Plain words match titles, projects, branches, descriptions and prompts:
+
+![Searching "leak" in the picker](docs/search-text.png)
+
+| Key | Action |
+|---|---|
+| typing | filter (fuzzy on title, project, branch, PR numbers; falls back to description and prompts) |
+| `#42`, `acme/web#42`, PR URL | only sessions linked to that PR, creator first |
+| `p:` `b:` `f:` `repo:` `has:pr` | project, branch, edited file, repo, did PR work |
+| `@today` `@yesterday` `@week` `@month` `@3d` `@2w` | last active in that window |
+| `ctx:>80`, `ctx:<30` | how full the context window was at the end |
+| `ABC-123`, `t:abc-123` | sessions linked to that ticket |
+| `is:pinned` `has:note` `is:hidden` | your marks (hidden sessions only show with `is:hidden`) |
+| **Enter** | resume the session (in Tasks / PRs: list that task's or PR's sessions) |
+| **Tab** / **Shift-Tab** | cycle Sessions → Tasks → PRs |
+| `Ctrl-G` | toggle "here first" ranking (repo and branch you started in) |
+| `Ctrl-T` | hide / show one-off quick sessions (1 prompt, no edits, no PRs) |
+| `Ctrl-A` | actions menu for the selection (everything below, plus export, note, hide, copy id) |
+| `Ctrl-V` | read the conversation (`/` find, `n`/`N` next/prev, `o` tool output, Enter resume, Esc back) |
+| `Ctrl-K` | open the Jira / Linear ticket |
+| `Ctrl-S` | pin / unpin |
+| `Ctrl-E` | open the project in your editor (`$CCTRAIL_EDITOR`, `$VISUAL`, `$EDITOR`, else VS Code / Cursor / Zed) |
+| `Ctrl-O` | resume in a new terminal tab (tmux, zellij, wezterm, kitty, iTerm2, Terminal.app, GNOME Terminal, Konsole, Windows Terminal, …) |
+| `Ctrl-Y` | copy `cd … && claude --resume …` |
+| `Ctrl-F` | toggle full-text search |
+| `Ctrl-D` | have Claude describe the selected session |
+| `Ctrl-B` | open the session's PR in your browser (else its claude.ai page) |
+| `Ctrl-R` | re-index |
+| `←` / `→` | scroll the preview |
+| `Esc` | clear the query, or quit |
+
+## AI descriptions
 
 ```bash
-pip install .            # or: pip install '.[tui]' for the TUI too
+export ANTHROPIC_API_KEY=sk-ant-...
+cctrail describe            # the 20 most recent sessions without one
+cctrail describe --all      # every session that needs one
+cctrail describe a1b2c3d4   # one session (or Ctrl-D in the picker)
 ```
 
-Both `cctrail` (console script) and `python -m cctrail` work after install.
+Claude gets a compact digest of the session: your prompts, files edited,
+PR roles, and the end of the last reply. It writes back a title of up to 8
+words and a one- or two-sentence summary, which are cached in the index.
+Sessions are described again only after they grow noticeably. The default
+model is `claude-opus-5-5` at low effort; set `"describe_model"` in the
+config or pass `--model` to change it.
 
-### Uninstall
+## Cloud sessions (claude.ai/code) and GitHub sync
+
+PRs opened from claude.ai cloud sessions carry a `claude.ai/code/session_…`
+link in their body. With the [GitHub CLI](https://cli.github.com)
+logged in:
 
 ```bash
-pipx uninstall cctrail     # if installed via pipx
-# or
-pip uninstall cctrail      # if installed via pip
+cctrail sync                       # every repo seen in your sessions
+cctrail sync --repo acme/web -n 500
+cctrail pr 42 --sync               # refresh one PR
 ```
 
-## Interactive TUI (lazygit-style)
+This fetches PR titles and state, and marks PRs whose body links a cloud
+session, or carries the "Generated with Claude Code" footer, as **born from
+Claude**, even when there's no transcript on this machine. It also links
+sessions that worked on a PR's head branch.
+
+## Shell integration
 
 ```bash
-cctrail tui
+eval "$(cctrail shell-init zsh)"     # or bash; fish: cctrail shell-init fish | source
 ```
 
-![cctrail TUI screenshot](docs/screenshot.png)
+This gives you **Alt-S** to open the picker from any prompt, and
+**`ccd [query]`** to pick a session and `cd` into its directory without
+resuming it. `ccd` uses `cctrail pick --print-dir`; the picker draws on
+stderr, so command substitution works.
 
-A three-pane interface: projects on the left, sessions in the middle,
-detail view on the right, with a live filter box up top.
-
-| Key       | Action                                                |
-|-----------|--------------------------------------------------------|
-| `/`       | Focus the search box                                    |
-| (typing)  | Live-filters the session list as you type                |
-| `Enter`   | Runs a full-text search (in the search box) / opens the full transcript (in the session list) |
-| `p`       | Focus the project panel                                 |
-| `↑` / `↓` | Move through whichever panel is focused                  |
-| `y`       | Copy the selected session's UUID to the clipboard        |
-| `Y`       | Copy the `claude --resume <uuid>` command to the clipboard |
-| `o`       | Open a new terminal tab, cd into the session's directory, and run `claude --resume` there |
-| `d`       | Show git commits/diffstat made during this session's time window |
-| `L`       | Show this session's lineage (resume chain / adjacent sessions) |
-| `t`       | Add tag(s) to the selected session                       |
-| `n`       | Set (or clear) a note on the selected session            |
-| `Esc`     | Clear search (if focused there) / focus the list          |
-| `s`       | Open the stats overlay                                  |
-| `i`       | Reindex (picks up new sessions without leaving)          |
-| `q`       | Quit                                                     |
-
-Selecting a project in the left panel scopes the session list to just
-that project — combine it with the search box to filter by project *and*
-keyword at once. Select "All projects" (top of the list) to clear the
-project filter. A `*` before a session's UUID in the list means it has
-tags.
-
-The list falls back to a plain substring match if the full-text index
-doesn't return anything for very short fragments, so partial words still
-work.
-
-### Reading a session (`Enter`)
-
-Opens the full conversation — every prompt, response, and tool call — in
-a scrollable overlay. This is also available outside the TUI:
+## Use from Claude Code (MCP)
 
 ```bash
-cctrail view a1b2c3d4
+claude mcp add cctrail -- cctrail mcp
 ```
 
-### Resuming a session (`y` / `Y` / `o`)
+Claude then gets four tools that work on your local index:
 
-`y` and `Y` try two clipboard mechanisms at once: a terminal OSC-52 escape
-(works in most terminals, including over SSH, but **not** macOS
-Terminal.app) and a native tool (`pbcopy` / `xclip` / `xsel` / `wl-copy` /
-`clip`, which does cover Terminal.app). Whichever lands, you'll get a
-notification either way.
+| Tool | What it returns |
+|---|---|
+| `search_sessions` | Sessions matching a query (same syntax as the picker, or full-text) |
+| `get_session` | Description, prompts, files, PRs (and who else created or reviewed them), notes, last reply, resume command |
+| `read_transcript` | The conversation; with `query`, just the passages that mention it |
+| `find_pr` | Which sessions created, reviewed or worked on a PR |
 
-`o` opens a new terminal tab/window already `cd`'d into the session's
-directory and running `claude --resume <uuid>`. Support depends on what
-you're running in:
+Ask things like *"find the session where we added rate limiting and tell me
+how the bucket was shared"* or *"who reviewed PR 88?"*. It only reads
+transcripts on your machine and re-indexes incrementally before each call.
 
-- Inside **tmux**: opens a new tmux window (works regardless of OS).
-- **macOS**: iTerm2 gets a new tab via AppleScript; otherwise a new
-  Terminal.app window.
-- **Linux**: tries `gnome-terminal`, `konsole`, `xfce4-terminal`, then
-  `xterm`, in that order.
-- **Windows**: Windows Terminal (`wt`) if installed, else a new `cmd.exe`
-  window.
+## How tasks are formed
 
-If none of these match your setup, `o` reports why it couldn't open a
-terminal rather than failing silently — `y`/`Y` (copy the command
-yourself) are the reliable fallback.
+Two sessions land in the same task when they share a ticket key, or when they:
 
-The same resume flow is available outside the TUI:
+- worked on the same non-default branch (anything but `main`, `master`,
+  `develop`, `dev` or `trunk`) of the same repo, or
+- both did something concrete with the same PR: created, reviewed, merged,
+  commented on, or worked on it.
 
-```bash
-cctrail resume a1b2c3d4                 # prints + copies the resume command
-cctrail resume a1b2c3d4 --open          # also opens a new terminal tab and runs it
-cctrail resume a1b2c3d4 --no-copy       # skip the clipboard copy
-```
+The task's title is the PR title when one is known (after `cctrail sync`),
+otherwise the branch name. Only groups of two or more sessions are listed.
 
-### Git-aware diff (`d`)
+## How detection works
 
-If the session's directory is a git repo, shows the commits made during
-that session's time window (with a small buffer) plus an aggregate
-diffstat. Outside the TUI:
+| Role | Evidence |
+|---|---|
+| ● created | `gh pr create` (number taken from its output), `gh api -X POST repos/o/r/pulls`, MCP `create_pull_request`, or a synced PR whose body links this session |
+| ◆ reviewed | `gh pr review`, review/comment POSTs to `…/pulls/N/reviews`, MCP review tools, `/review N` / `/code-review N`, or a prompt asking to review a PR |
+| ✔ merged | `gh pr merge`, MCP `merge_pull_request` |
+| ✎ commented | `gh pr comment`, `…/issues/N/comments`, MCP `add_issue_comment` |
+| ↻ worked on | `gh pr checkout/edit`, MCP `update_pull_request`, PR activity subscriptions, "address the review comments on #N", or the PR's head branch |
+| · viewed / mentioned | `gh pr view/diff`, MCP `pull_request_read`, PR URLs in prompts or replies |
 
-```bash
-cctrail diff a1b2c3d4
-```
+A bare `#42` is resolved to a repo using, in order: `-R owner/repo`, the
+session directory's `origin` remote, `git push` output in the transcript,
+and other PR URLs in the same session.
 
-This only looks at commit *timestamps* against the session's time range —
-it doesn't try to attribute specific hunks to specific prompts, so treat
-it as "what changed in this repo around the time of this session," not a
-guaranteed causal link.
+## Configuration
 
-### Lineage (`L`)
-
-Shows sessions related to this one — either an explicit parent/child link
-if your Claude Code version records one when branching/resuming a
-session, or (much more commonly, since that field isn't confirmed to
-exist in the current transcript format) a **heuristic** guess: the
-nearest session before/after this one in the same directory, only shown
-if the gap is under 4 hours. Heuristic results are always labelled as
-such — they're a "possibly continues" signal, not a fact. Outside the
-TUI:
-
-```bash
-cctrail lineage a1b2c3d4
-```
-
-### Tags & notes (`t` / `n`)
-
-Personal organization on top of project/search — tag a session
-("bugfix", "revisit") or leave yourself a note. Both are filterable and
-searchable.
-
-```bash
-cctrail tag a1b2c3d4 bugfix important
-cctrail untag a1b2c3d4 important
-cctrail note a1b2c3d4 "Circle back after the v2 release"
-cctrail note a1b2c3d4              # clears the note
-cctrail search bugfix --tag bugfix
-cctrail list --tag bugfix
-```
-
-## Commands
-
-### `cctrail index`
-Scans `~/.claude/projects/` (or your configured override) and (re)builds
-the local index. Safe to run repeatedly — unchanged transcripts are
-skipped, changed ones are re-indexed, ignored projects are skipped
-entirely.
-
-```bash
-cctrail index
-```
-
-### `cctrail watch [--interval N]`
-Runs `index` continuously (default: every 30s) instead of you having to
-wire up your own cron job. Only prints a line when something actually
-changed; Ctrl+C to stop.
-
-```bash
-cctrail watch
-cctrail watch --interval 10
-```
-
-For a persistent background service instead of a foreground loop, wrap
-this in a systemd user unit / launchd agent, or fall back to the cron
-approach below.
-
-### `cctrail stats`
-Overall usage statistics: total sessions, total time, breakdown by
-project, day of week, hour of day, token usage (if your transcripts
-record it), and your most recent sessions.
-
-```bash
-cctrail stats
-```
-
-### `cctrail search <keywords...> [--project <substr>] [--tag <tag>]`
-Full-text search across every prompt, response, and tool call in your
-session history. Uses SQLite FTS5, so it's fast even with thousands of
-sessions.
-
-```bash
-cctrail search taxonomy mapping bug
-cctrail search refactor --project qa-automation
-cctrail search "" --tag bugfix   # tag-only filter
-```
-
-### `cctrail view <uuid>`
-Print the full conversation transcript for a session — every prompt,
-response, and tool call, in order.
-
-```bash
-cctrail view a1b2c3d4 | less
-```
-
-### `cctrail diff <uuid>`
-Git commits + diffstat made in the session's directory during its time
-window (see "Git-aware diff" above).
-
-### `cctrail lineage <uuid>`
-Related sessions — explicit resume-chain link if recorded, otherwise a
-labelled time-adjacency heuristic (see "Lineage" above).
-
-### `cctrail tag <uuid> <tag>...` / `cctrail untag <uuid> <tag>` / `cctrail note <uuid> [text]`
-See "Tags & notes" above.
-
-### `cctrail projects`
-List every project you've used Claude Code in, with session counts and
-last-active date.
-
-```bash
-cctrail projects
-```
-
-### `cctrail resume <uuid> [--open] [--no-copy]`
-Print the resume command for a session, copy it to the clipboard, and
-optionally open a new terminal tab already `cd`'d into the session's
-directory and running it.
-
-### `cctrail show <uuid>`
-Full detail for one session — you can pass a UUID prefix instead of the
-full UUID (like short git hashes).
-
-```bash
-cctrail show a1b2c3d4
-```
-
-### `cctrail list [--project <substr>] [--tag <tag>]`
-Recent sessions, optionally filtered by project path and/or tag.
-
-```bash
-cctrail list --project excel2ixbrl
-cctrail list --tag bugfix
-```
-
-### `cctrail prune`
-Removes indexed sessions whose transcript file no longer exists on disk
-(e.g. purged by Claude Code's own retention settings). Doesn't touch
-anything on disk — just cleans up stale index entries.
-
-```bash
-cctrail prune
-```
-
-### `cctrail forget <uuid>`
-Removes one session from the local index only — the original transcript
-file is untouched. Useful for excluding something sensitive from your
-locally searchable database without deleting the actual Claude Code
-history.
-
-```bash
-cctrail forget a1b2c3d4
-```
-
-### `cctrail config` / `cctrail ignore <substr>` / `cctrail unignore <substr>`
-Shows the effective config (`~/.cctrail/config.json`), or adds/removes a
-project-path substring from the ignore list. Ignored projects are
-skipped entirely during indexing — their transcripts are never read.
-
-```bash
-cctrail config
-cctrail ignore client-acme      # never index anything with "client-acme" in the path
-cctrail unignore client-acme
-```
-
-You can also hand-edit `~/.cctrail/config.json` directly — it currently
-supports:
+`cctrail config` shows the paths in use. `~/.cctrail/config.json`:
 
 ```json
 {
   "claude_projects_dir": null,
-  "ignored_projects": []
+  "ignored_projects": [],
+  "describe_model": "claude-opus-5-5",
+  "context_windows": {},
+  "tickets": {
+    "ABC": "https://acme.atlassian.net/browse/{key}",
+    "ENG": "https://linear.app/acme/issue/{key}"
+  }
 }
 ```
 
-Set `claude_projects_dir` if your Claude Code transcripts live somewhere
-other than `~/.claude/projects`.
+- `claude_projects_dir` defaults to `$CLAUDE_CONFIG_DIR/projects` or
+  `~/.claude/projects`.
+- `context_windows` overrides the context size used for the ◔ percentage,
+  matched as a substring of the model id, e.g. `{"sonnet-4-5": 1000000}`.
+  Built in: 1M for the Claude 5 family, Opus 4.6–4.8, Sonnet 4.6 and `[1m]`
+  models; 200k for the rest.
+- `tickets` maps a ticket prefix to its URL (`{key}` is replaced; `"*"`
+  matches any prefix). Keys in branch names are always picked up. A key that
+  appears only in a prompt counts when its prefix is listed here, or was seen
+  in some branch name. That keeps things like `UTF-8` and `SHA-256` out.
+- `cctrail ignore <substring>` / `cctrail unignore <substring>` stops (or
+  resumes) indexing matching projects.
+- `CCTRAIL_HOME` moves the index and config elsewhere.
+- `--no-index` skips the automatic incremental index for one command.
 
-## Automatic indexing on session exit
+The index is a SQLite file. Pins, notes and hidden flags live in their own
+table and survive re-indexing. If Claude Code's retention deletes a transcript,
+the session stays searchable but is marked *transcript deleted* and can't be
+resumed.
 
-Three options, roughly in order of how much setup they need:
+## Limitations
 
-1. **`cctrail watch`** (see above) — run it in a spare terminal, tmux
-   pane, or as a background service. No cron needed.
-2. **cron / launchd**, running `index` every few minutes — indexing is
-   cheap since it skips unchanged files:
+- The JSONL transcript format is internal to Claude Code. Parsing is
+  defensive, but a big format change may need a parser update.
+- Role detection is evidence-based, not authoritative. A PR you reviewed by
+  reading the diff in chat counts as *reviewed* only if you asked for a
+  review, or the session posted one.
+- Cloud-only sessions can't be resumed locally; `Ctrl-B` opens them on
+  claude.ai.
 
-   ```bash
-   # crontab -e
-   */5 * * * * cctrail index >> ~/.cctrail/index.log 2>&1
-   ```
-3. **A Claude Code `SessionEnd` hook**, if your installed version
-   supports one (check `claude config` / the hooks documentation) —
-   trigger `cctrail index` directly for near-instant indexing.
+## Development
 
-## Project layout
-
+```bash
+cargo test
+cargo clippy
+cargo run --release -- list
+CCTRAIL_TIMING=1 cargo run --release -- index --full   # time per indexing phase
 ```
-cctrail/  # (repo root)
-├── pyproject.toml        # package metadata, `cctrail` console script entry point
-├── install.sh            # convenience installer (pipx, falls back to pip)
-├── src/cctrail/
-│   ├── core.py           # DB setup, transcript parsing, index/search/stats/tags/lineage logic
-│   ├── cli.py            # argparse entry point (`cctrail.cli:main`)
-│   ├── tui.py            # Textual-based interactive UI (`cctrail tui`)
-│   ├── terminal.py        # clipboard + new-terminal-tab spawning
-│   ├── gitutil.py         # git commit window / diffstat lookup
-│   ├── viewer.py          # full-transcript rendering (CLI + TUI)
-│   └── config.py          # ~/.cctrail/config.json load/save, ignore-list checks
-└── README.md
-```
-
-## Known limitations
-
-- **Project path decoding is lossy, but resume directories usually aren't.**
-  Claude Code encodes your working directory into the folder name by
-  replacing `/` with `-`; if your actual path contains a literal `-` (e.g.
-  `qa-automation-tool`), decoding that folder name back is ambiguous. The
-  `project` column is a best-effort display value built from this decoding.
-  However, `cctrail index` also captures the exact `cwd` recorded inside
-  the transcript itself (when your Claude Code version records one), which
-  is what `resume`, `y`/`Y`/`o`/`d` in the TUI, and `cctrail show`'s
-  "Directory" field actually use — so resuming/diffing works even when the
-  displayed project path doesn't perfectly reverse the encoding.
-- **Opening a new terminal tab (`o` / `--open`) is best-effort** and
-  depends on what terminal/multiplexer you're running — see the TUI
-  section above for what's supported. If none match, use `y`/`Y` to copy
-  the UUID or resume command instead and paste it into a new tab yourself.
-- **Lineage is usually a heuristic, not a fact.** No confirmed field in
-  the current Claude Code transcript format records "this session
-  continues that one" — `cctrail` looks for a few plausible field names,
-  and if none are found, falls back to guessing from same-directory +
-  time-adjacency. That fallback is always labelled "heuristic" in the
-  output; treat it as a hint to check, not a guarantee.
-- **Git diff is time-window-based, not content-based** — it shows commits
-  whose timestamps fall in the session's range, not commits provably
-  caused by that session's edits.
-- **Token usage has no dollar figures attached** — pricing changes over
-  time and varies by model, so `cctrail` only reports raw token counts.
-  Check docs.claude.com for current pricing if you want to convert.
-- **The JSONL transcript format is internal to Claude Code** and can change
-  between releases. This tool parses defensively (skips malformed lines,
-  tolerates missing fields) but a major format change could still require
-  an update to the parser.
-- Sessions are only as available as your local retention settings allow —
-  if `cleanupPeriodDays` purges old transcripts, they're gone before
-  `cctrail index` ever sees them (`cctrail prune` cleans up the index side
-  of that after the fact). Run `index` (or `watch`) regularly if you want
-  a full history.
