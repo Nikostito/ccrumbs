@@ -34,7 +34,7 @@ fn ok_prefix(p: &str) -> bool {
     !STOP.contains(&p)
 }
 
-/// Keys in a branch name (case-insensitive, e.g. `nikos/eng-42-dark-mode`).
+/// Keys in a branch name (case-insensitive, e.g. `you/eng-42-dark-mode`).
 pub fn from_branch(branch: &str) -> Vec<String> {
     // Overlapping matches: scan with a sliding start so `a/eng-1-b` and `x-2` both work.
     let mut out = Vec::new();
@@ -87,7 +87,7 @@ mod tests {
     #[test]
     fn branch_keys() {
         assert_eq!(from_branch("feature/ABC-123-add-login"), vec!["ABC-123"]);
-        assert_eq!(from_branch("nikos/eng-42-dark-mode"), vec!["ENG-42"]);
+        assert_eq!(from_branch("you/eng-42-dark-mode"), vec!["ENG-42"]);
         assert!(from_branch("feat/rate-limit").is_empty());
         assert!(from_branch("release-2026").is_empty());
         assert!(from_branch("main").is_empty());

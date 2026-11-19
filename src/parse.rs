@@ -498,7 +498,7 @@ mod tests {
 
     #[test]
     fn rejects_unsafe_ids() {
-        assert!(valid_id("ab3b84ec-75e5-5c62-b5e5-5a44ead9213b"));
+        assert!(valid_id("0f1e2d3c-4b5a-4968-8776-a5b4c3d2e1f0"));
         assert!(!valid_id("x;touch${IFS}pwned"));
         assert!(!valid_id("a b"));
     }
