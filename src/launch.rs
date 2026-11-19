@@ -197,18 +197,22 @@ pub fn open_tab(s: &SessionRow) -> Result<String> {
 
     if cfg!(target_os = "macos") {
         let esc = script.replace('\\', "\\\\").replace('"', "\\\"");
+        // The keystrokes below merge with keys still held down: pressed via ^o, Ctrl is
+        // usually still down, so ⌘T becomes ⌃⌘T (no tab) and the command is typed into
+        // ccrumbs itself. Wait (up to 2 s) until Shift, Ctrl, Option and ⌘ are released.
+        let wait_keys = "use framework \"AppKit\"\nuse scripting additions\nrepeat 40 times\nif ((current application's NSEvent's modifierFlags()) as integer) div 131072 mod 16 = 0 then exit repeat\ndelay 0.05\nend repeat\n";
         let osa = match term.as_str() {
             "iTerm.app" => format!(
                 "tell application \"iTerm2\" to tell current window\ncreate tab with default profile\ntell current session to write text \"{esc}\"\nend tell"
             ),
             // Terminal.app has no "new tab" command: press ⌘T, then run in that tab.
             "Apple_Terminal" => format!(
-                "tell application \"Terminal\" to activate\ntell application \"System Events\" to keystroke \"t\" using command down\ndelay 0.3\ntell application \"Terminal\" to do script \"{esc}\" in selected tab of front window"
+                "{wait_keys}tell application \"Terminal\" to activate\ntell application \"System Events\" to keystroke \"t\" using command down\ndelay 0.3\ntell application \"Terminal\" to do script \"{esc}\" in selected tab of front window"
             ),
             // Ghostty, Warp, Hyper, Tabby: ⌘T opens a tab, then type the command. Only for
             // these, and never over SSH: the keystrokes go to whatever app is in front.
             "ghostty" | "WarpTerminal" | "Hyper" | "Tabby" if !env("SSH_CONNECTION") => format!(
-                "tell application \"System Events\"\nkeystroke \"t\" using command down\ndelay 0.4\nkeystroke \"{esc}\"\nkey code 36\nend tell"
+                "{wait_keys}tell application \"System Events\"\nkeystroke \"t\" using command down\ndelay 0.4\nkeystroke \"{esc}\"\nkey code 36\nend tell"
             ),
             _ => bail!(
                 "can't open a tab in this terminal{}; use ^y to copy the command",
