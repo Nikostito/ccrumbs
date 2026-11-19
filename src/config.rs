@@ -1,4 +1,4 @@
-//! `~/.cctrail/config.json` and well-known paths.
+//! `~/.ccrumbs/config.json` and well-known paths.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -13,7 +13,7 @@ pub struct Config {
     pub claude_projects_dir: Option<String>,
     /// Project path substrings that are never indexed.
     pub ignored_projects: Vec<String>,
-    /// Model used by `cctrail describe`.
+    /// Model used by `ccrumbs describe`.
     pub describe_model: String,
     /// Override context windows: model-id substring -> tokens, e.g. {"sonnet-4-5": 1000000}.
     pub context_windows: std::collections::BTreeMap<String, u64>,
@@ -23,7 +23,7 @@ pub struct Config {
     /// TUI colors: "dark" (own gray-black theme, default) or "terminal" (your terminal's palette).
     pub theme: String,
     /// Command that opens a project, e.g. "cursor", "open -a \"PyCharm\"", "nvim".
-    /// Unset: cctrail asks the first time (Ctrl-E) and remembers.
+    /// Unset: ccrumbs asks the first time (Ctrl-E) and remembers.
     pub editor: Option<String>,
 }
 
@@ -88,7 +88,7 @@ pub fn set_ticket_url(prefix: &str, template: &str) -> Result<()> {
     Ok(())
 }
 
-/// Remember the editor to open projects with (`None` forgets it, so cctrail asks again).
+/// Remember the editor to open projects with (`None` forgets it, so ccrumbs asks again).
 pub fn set_editor(command: Option<&str>) -> Result<()> {
     let mut cfg = Config::load();
     cfg.editor = command.map(str::to_string);
@@ -131,14 +131,62 @@ impl Default for Config {
     }
 }
 
-/// `$CCTRAIL_HOME` or `~/.cctrail`.
+/// Read `$CCRUMBS_<name>`, falling back to the pre-rename `$CCTRAIL_<name>`.
+pub fn env(name: &str) -> Option<String> {
+    std::env::var(format!("CCRUMBS_{name}"))
+        .or_else(|_| std::env::var(format!("CCTRAIL_{name}")))
+        .ok()
+        .filter(|v| !v.is_empty())
+}
+
+/// `$CCRUMBS_HOME` or `~/.ccrumbs`.
 pub fn data_dir() -> PathBuf {
-    if let Ok(h) = std::env::var("CCTRAIL_HOME") {
+    if let Some(h) = env("HOME") {
         return PathBuf::from(h);
     }
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".cctrail")
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let dir = home.join(".ccrumbs");
+    migrate_from_cctrail(&home, &dir);
+    dir
+}
+
+/// This tool used to be called cctrail and kept its data in `~/.cctrail`. Copy (never
+/// move) its index and config the first time, but only if they are ours: an unrelated
+/// tool on crates.io is also called cctrail, so `index.db` must have our `marks` table.
+fn migrate_from_cctrail(home: &std::path::Path, dir: &std::path::Path) {
+    let old = home.join(".cctrail");
+    let old_db = old.join("index.db");
+    if dir.exists() || !old_db.is_file() {
+        return;
+    }
+    let Ok(conn) =
+        rusqlite::Connection::open_with_flags(&old_db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    else {
+        return;
+    };
+    let ours = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'marks'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false);
+    if !ours || std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    // VACUUM INTO reads through the write-ahead log, so nothing recent is lost.
+    if conn
+        .execute("VACUUM INTO ?1", [dir.join("index.db").to_string_lossy()])
+        .is_err()
+    {
+        return;
+    }
+    let _ = std::fs::copy(old.join("config.json"), dir.join("config.json"));
+    eprintln!(
+        "ccrumbs: copied your index and settings from {} (cctrail is now ccrumbs)",
+        old.display()
+    );
 }
 
 pub fn config_path() -> PathBuf {
@@ -150,11 +198,19 @@ pub fn db_path() -> PathBuf {
 }
 
 impl Config {
+    /// The config, or defaults if there is none. A file that doesn't parse is
+    /// reported once and ignored (and `save` refuses to overwrite it).
     pub fn load() -> Config {
-        let cfg: Config = std::fs::read_to_string(config_path())
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
+        let cfg = match Config::read() {
+            Ok(c) => c,
+            Err(e) => {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    eprintln!("ccrumbs: ignoring {}: {e:#}", config_path().display())
+                });
+                Config::default()
+            }
+        };
         let _ = OVERRIDES.set(cfg.context_windows.clone());
         if let Ok(mut t) = TICKETS.write() {
             *t = cfg.tickets.clone();
@@ -162,9 +218,28 @@ impl Config {
         cfg
     }
 
+    /// Parse the config file; a missing file is fine, a broken one is an error.
+    fn read() -> Result<Config> {
+        match std::fs::read_to_string(config_path()) {
+            Ok(s) => serde_json::from_str(&s).map_err(|e| anyhow::anyhow!("not valid JSON ({e})")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Write the config atomically. Refuses when the file on disk doesn't parse, so a
+    /// typo never turns into "all your settings are gone".
     pub fn save(&self) -> Result<()> {
+        if let Err(e) = Config::read() {
+            anyhow::bail!(
+                "{} is {e:#}; fix it first so your settings aren't overwritten",
+                config_path().display()
+            );
+        }
         std::fs::create_dir_all(data_dir())?;
-        std::fs::write(config_path(), serde_json::to_string_pretty(self)? + "\n")?;
+        let tmp = config_path().with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_string_pretty(self)? + "\n")?;
+        std::fs::rename(&tmp, config_path())?;
         Ok(())
     }
 

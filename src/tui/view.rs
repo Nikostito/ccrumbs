@@ -129,9 +129,10 @@ fn grouped_list(
                 } else {
                     Style::new()
                 };
-                let room = w.saturating_sub(right.chars().count() + 7);
+                let room = w.saturating_sub(crate::text::width(&right) + 7);
                 let text = fit(&text, room);
-                let pad = w.saturating_sub(4 + text.chars().count() + right.chars().count() + 2);
+                let pad = w
+                    .saturating_sub(4 + crate::text::width(&text) + crate::text::width(&right) + 2);
                 lines.push(Line::from(vec![
                     Span::styled(if sel { "▌" } else { " " }, bg.fg(th::accent())),
                     Span::styled(" ", bg),
@@ -278,7 +279,11 @@ fn facts(
     r: Option<(&str, Vec<Span<'static>>)>,
 ) -> Line<'static> {
     let mut v = vec![Span::styled(format!("{:<9}", l.0), dim())];
-    let lw_used: usize = 9 + l.1.iter().map(|s| s.content.chars().count()).sum::<usize>();
+    let lw_used: usize = 9 + l
+        .1
+        .iter()
+        .map(|s| crate::text::width(&s.content))
+        .sum::<usize>();
     v.extend(l.1);
     if let Some((k, vals)) = r {
         v.push(Span::raw(" ".repeat(lw.saturating_sub(lw_used).max(2))));
@@ -696,7 +701,7 @@ pub(super) fn task_card(f: &mut Frame, app: &App, area: Rect) {
 pub(super) fn pr_list(f: &mut Frame, app: &mut App, area: Rect) {
     if app.pr_shown.is_empty() {
         let msg = if app.prs.is_empty() {
-            "  No PRs in your sessions yet. `cctrail sync` adds titles and PRs opened from claude.ai."
+            "  No PRs in your sessions yet. `ccrumbs sync` adds titles and PRs opened from claude.ai."
         } else {
             "  No matching PRs."
         };
@@ -843,7 +848,7 @@ pub(super) fn pr_card(f: &mut Frame, app: &App, area: Rect) {
     if p.meta.is_none() {
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
-            "No title or state yet: `cctrail sync` fetches them from GitHub.",
+            "No title or state yet: `ccrumbs sync` fetches them from GitHub.",
             dim(),
         )));
     }
@@ -891,7 +896,16 @@ pub(super) fn header(f: &mut Frame, app: &App, top: Rect, split_x: u16) {
             Style::new().fg(th::faint()),
         ));
     }
-    let qx = split_x.max(30) + 2;
+    // Search sits over the detail pane when there's room, else right after the tabs.
+    let qx = if top.width >= 80 {
+        split_x.max(30) + 2
+    } else {
+        26.min(top.width)
+    };
+    let q_used = qx as usize
+        + 3
+        + crate::text::width(&app.query)
+        + if app.query.is_empty() { 31 } else { 0 };
     f.render_widget(
         Paragraph::new(Line::from(q)),
         Rect {
@@ -913,10 +927,116 @@ pub(super) fn header(f: &mut Frame, app: &App, top: Rect, split_x: u16) {
             Style::new().fg(th::green()),
         ));
     }
+    // Only when it doesn't cover the query.
+    let right_w: usize = right.iter().map(|s| crate::text::width(&s.content)).sum();
+    if q_used + right_w < top.width as usize {
+        f.render_widget(
+            Paragraph::new(Line::from(right)).alignment(ratatui::layout::Alignment::Right),
+            top,
+        );
+    }
+}
+
+/// A bordered overlay. When the items don't fit the height, they're laid out in
+/// two columns instead of being cut off.
+pub(super) fn popup(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    head: Vec<Line<'static>>,
+    items: Vec<Line<'static>>,
+    foot: Vec<Line<'static>>,
+    col_w: u16,
+) {
+    let mut head = head;
+    let mut foot = foot;
+    let need = (head.len() + items.len() + foot.len()) as u16 + 2;
+    // Two columns when it's too tall; narrower columns on narrow screens.
+    let col_w = if area.width >= col_w * 2 + 4 {
+        col_w
+    } else {
+        col_w.min(area.width.saturating_sub(4) / 2).max(24)
+    };
+    let two = need > area.height && area.width >= col_w * 2 + 4 && items.len() > 1;
+    let rows_needed = if two {
+        items.len().div_ceil(2)
+    } else {
+        items.len()
+    };
+    // Still too tall: drop the header and footer lines rather than items.
+    if (head.len() + rows_needed + foot.len()) as u16 + 2 > area.height {
+        head.retain(|l| !l.spans.is_empty() && l.width() > 0);
+        head.truncate(1);
+        foot.clear();
+        if (head.len() + rows_needed) as u16 + 2 > area.height {
+            head.clear();
+        }
+    }
+    let rows = if two {
+        items.len().div_ceil(2)
+    } else {
+        items.len()
+    };
+    let h = ((head.len() + rows + foot.len()) as u16 + 2).min(area.height);
+    let w = (if two { col_w * 2 + 3 } else { col_w + 2 }).min(area.width);
+    let r = Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + (area.height - h) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, r);
+    let block = Block::bordered()
+        .title(format!(" {title} "))
+        .border_style(Style::new().fg(th::accent()))
+        .style(Style::new().bg(th::panel()));
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+    let hh = head.len() as u16;
     f.render_widget(
-        Paragraph::new(Line::from(right)).alignment(ratatui::layout::Alignment::Right),
-        top,
+        Paragraph::new(head),
+        Rect {
+            height: hh.min(inner.height),
+            ..inner
+        },
     );
+    let body = Rect {
+        y: inner.y + hh,
+        height: inner.height.saturating_sub(hh + foot.len() as u16),
+        ..inner
+    };
+    if two {
+        let (a, b) = items.split_at(rows);
+        let half = body.width / 2;
+        f.render_widget(
+            Paragraph::new(a.to_vec()),
+            Rect {
+                width: half,
+                ..body
+            },
+        );
+        f.render_widget(
+            Paragraph::new(b.to_vec()),
+            Rect {
+                x: body.x + half + 1,
+                width: body.width.saturating_sub(half + 1),
+                ..body
+            },
+        );
+    } else {
+        f.render_widget(Paragraph::new(items), body);
+    }
+    let fy = body.y + body.height;
+    if fy < inner.y + inner.height {
+        f.render_widget(
+            Paragraph::new(foot),
+            Rect {
+                y: fy,
+                height: inner.y + inner.height - fy,
+                ..inner
+            },
+        );
+    }
 }
 
 pub(super) fn footer(f: &mut Frame, app: &App, bottom: Rect) {
@@ -976,27 +1096,17 @@ pub(super) fn help(f: &mut Frame, area: Rect) {
             head_style(),
         ))
     };
-    let lines = vec![
-        Line::raw(""),
-        h("Keys"),
-        k(
-            "enter",
-            "resume the session (in Tasks / PRs: list its sessions)",
-        ),
+    let items = vec![
+        h("Keys  (Alt works like Ctrl)"),
+        k("enter", "resume (in Tasks / PRs: list its sessions)"),
         k("tab  shift-tab", "Sessions · Tasks · PRs"),
         k("^v", "read the conversation"),
         k("^b  ^k", "open its PR · its ticket"),
-        k(
-            "^e",
-            "open the project in your editor (^a i to change editor)",
-        ),
-        k("^o  ^y", "resume in a new tab · copy the resume command"),
+        k("^e", "open in your editor (^a i: change editor)"),
+        k("^o  ^y", "resume in a new tab · copy the command"),
         k("^s", "pin / unpin"),
-        k("^a", "all actions (note, hide, export, describe, copy id…)"),
-        k(
-            "^g  ^t  ^f",
-            "here-first ranking · hide quick sessions · full-text",
-        ),
+        k("^a  F2", "all actions (note, hide, export, describe…)"),
+        k("^g  ^t  ^f", "here first · hide quick · full-text"),
         k("← →", "scroll the details"),
         k("esc", "clear the search, or quit"),
         Line::raw(""),
@@ -1005,30 +1115,19 @@ pub(super) fn help(f: &mut Frame, area: Rect) {
         k("ABC-123", "sessions linked to a ticket"),
         k("p:  b:  f:", "project · branch · a file it edited"),
         k("@today  @3d", "@yesterday · @week · @month · @2w"),
-        k(
-            "ctx:>80",
-            "context fill · has:pr · has:note · is:pinned · is:hidden",
-        ),
-        Line::raw(""),
-        Line::from(Span::styled("  any key closes", dim())),
+        k("ctx:>80", "context fill"),
+        k("has:pr has:note", "is:pinned · is:hidden"),
     ];
-    let hgt = (lines.len() as u16 + 2).min(area.height);
-    let w = 80.min(area.width);
-    let r = Rect {
-        x: area.x + (area.width - w) / 2,
-        y: area.y + (area.height.saturating_sub(hgt)) / 2,
-        width: w,
-        height: hgt,
-    };
-    f.render_widget(Clear, r);
-    f.render_widget(
-        Paragraph::new(lines)
-            .style(Style::new().bg(th::panel()))
-            .block(
-                Block::bordered()
-                    .title(" cctrail ")
-                    .border_style(Style::new().fg(th::accent())),
-            ),
-        r,
+    popup(
+        f,
+        area,
+        "ccrumbs",
+        vec![Line::raw("")],
+        items,
+        vec![
+            Line::raw(""),
+            Line::from(Span::styled("  any key closes", dim())),
+        ],
+        66,
     );
 }

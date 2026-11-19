@@ -27,10 +27,24 @@ use ratatui::{Frame, Terminal};
 type Term = Terminal<CrosstermBackend<std::io::Stderr>>;
 
 fn term_enter() -> Result<Term> {
-    use ratatui::crossterm::{execute, terminal};
+    use ratatui::crossterm::{event::EnableBracketedPaste, execute, terminal};
     terminal::enable_raw_mode()?;
-    execute!(std::io::stderr(), terminal::EnterAlternateScreen)?;
-    Ok(Terminal::new(CrosstermBackend::new(std::io::stderr()))?)
+    // Bracketed paste: a pasted newline must not act as Enter (resume).
+    if let Err(e) = execute!(
+        std::io::stderr(),
+        terminal::EnterAlternateScreen,
+        EnableBracketedPaste
+    ) {
+        term_leave();
+        return Err(e.into());
+    }
+    match Terminal::new(CrosstermBackend::new(std::io::stderr())) {
+        Ok(t) => Ok(t),
+        Err(e) => {
+            term_leave();
+            Err(e.into())
+        }
+    }
 }
 
 fn term_leave() {
@@ -38,6 +52,7 @@ fn term_leave() {
     let _ = terminal::disable_raw_mode();
     let _ = execute!(
         std::io::stderr(),
+        ratatui::crossterm::event::DisableBracketedPaste,
         terminal::LeaveAlternateScreen,
         cursor::Show
     );
@@ -110,9 +125,13 @@ struct Viewer {
     height: usize,
     input: Option<String>,
     find: String,
+    /// Row of the current search match.
+    found: Option<usize>,
 }
 
 fn wrap(s: &str, width: usize) -> Vec<String> {
+    // Wrap by terminal columns (CJK and emoji are two wide), preferring spaces.
+    use unicode_width::UnicodeWidthChar;
     let width = width.max(10);
     let mut out = Vec::new();
     for line in s.lines() {
@@ -123,10 +142,22 @@ fn wrap(s: &str, width: usize) -> Vec<String> {
         }
         let mut start = 0;
         while start < chars.len() {
-            let mut end = (start + width).min(chars.len());
+            let mut end = start;
+            let mut w = 0;
+            while end < chars.len() {
+                let cw = chars[end].width().unwrap_or(0);
+                if w + cw > width {
+                    break;
+                }
+                w += cw;
+                end += 1;
+            }
+            if end == start {
+                end = start + 1; // a single char wider than the line
+            }
             if end < chars.len() {
                 if let Some(sp) = chars[start..end].iter().rposition(|c| *c == ' ') {
-                    if sp > width / 3 {
+                    if sp > (end - start) / 3 {
                         end = start + sp + 1;
                     }
                 }
@@ -157,6 +188,7 @@ impl Viewer {
             height: 20,
             input: None,
             find: String::new(),
+            found: None,
         }
     }
 
@@ -212,19 +244,26 @@ impl Viewer {
         self.scroll = self.scroll.min(self.rows.len().saturating_sub(1));
     }
 
+    /// Jump to the next (or previous) row containing the search text. A new search
+    /// starts at the top of the screen; `n`/`N` continue from the current match.
     fn find_next(&mut self, forward: bool) -> bool {
         let q = self.find.to_lowercase();
-        if q.is_empty() {
+        if q.is_empty() || self.rows.is_empty() {
             return false;
         }
         let n = self.rows.len();
-        for k in 1..=n {
+        let (start, first_k) = match self.found {
+            Some(m) => (m, 1),
+            None => (self.scroll, 0),
+        };
+        for k in first_k..n + first_k {
             let i = if forward {
-                (self.scroll + 2 + k) % n
+                (start + k) % n
             } else {
-                (self.scroll + 2 + n * 2 - k) % n
+                (start + n * 2 - k) % n
             };
             if self.rows[i].1.to_lowercase().contains(&q) {
+                self.found = Some(i);
                 self.scroll = i.saturating_sub(2);
                 return true;
             }
@@ -484,13 +523,23 @@ pub fn run(db: &mut Db, cfg: &Config, initial: &str) -> Result<Outcome> {
 fn event_loop(term: &mut Term, app: &mut App, db: &mut Db, cfg: &Config) -> Result<Outcome> {
     loop {
         term.draw(|f| draw(f, app))?;
-        let Event::Key(k) = event::read()? else {
-            continue;
+        let k = match event::read()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => k,
+            Event::Paste(text) => {
+                app.paste(&text, db);
+                continue;
+            }
+            _ => continue,
         };
-        if k.kind != KeyEventKind::Press {
-            continue;
-        }
-        match on_key(app, k, db, cfg)? {
+        // A failing action (export, note, editor, re-index…) is shown, not fatal.
+        let step = match on_key(app, k, db, cfg) {
+            Ok(s) => s,
+            Err(e) => {
+                app.status = format!("{e:#}");
+                Step::Stay
+            }
+        };
+        match step {
             Step::Stay => {}
             Step::Exit(out) => return Ok(out),
             Step::Suspend(mut cmd) => {
@@ -509,6 +558,21 @@ fn event_loop(term: &mut Term, app: &mut App, db: &mut Db, cfg: &Config) -> Resu
 }
 
 impl App {
+    /// Pasted text goes into whatever is being typed, on one line.
+    fn paste(&mut self, text: &str, db: &Db) {
+        let t = crate::text::strip_controls(text).replace(['\r', '\n', '\t'], " ");
+        if let Some((_, buf)) = self.input.as_mut() {
+            buf.push_str(&t);
+        } else if let Some(v) = self.viewer.as_mut() {
+            if let Some(buf) = v.input.as_mut() {
+                buf.push_str(&t);
+            }
+        } else if !self.menu && !self.help && self.editor_pick.is_none() {
+            self.query.push_str(t.trim());
+            self.refilter(db);
+        }
+    }
+
     /// The session an action applies to: the selected one, a task's newest session,
     /// or the session that created the selected PR.
     fn target(&self) -> Option<&SessionRow> {
@@ -705,7 +769,7 @@ fn do_action(app: &mut App, a: Action, db: &mut Db, cfg: &Config) -> Result<Step
 fn open_editor_picker(app: &mut App) {
     let found = launch::detect_editors();
     if found.is_empty() {
-        app.status = "No editors found. Set one with: cctrail editor set <command>".into();
+        app.status = "No editors found. Set one with: ccrumbs editor set <command>".into();
     } else {
         let current = crate::config::Config::load().editor;
         let at = current
@@ -791,6 +855,7 @@ fn viewer_key(app: &mut App, k: KeyEvent) -> Step {
             KeyCode::Enter => {
                 v.find = std::mem::take(input);
                 v.input = None;
+                v.found = None;
                 if !v.find_next(true) {
                     app.status = format!("\"{}\" not found", v.find);
                 }
@@ -876,7 +941,7 @@ fn input_key(app: &mut App, k: KeyEvent, db: &mut Db) -> Result<Step> {
                             let url = tpl.replace("{key}", &key);
                             let _ = launch::open_url(&url);
                             app.status = format!(
-                                "Saved {prefix} links as {tpl} and opened {key}. Change it with `cctrail tickets set`."
+                                "Saved {prefix} links as {tpl} and opened {key}. Change it with `ccrumbs tickets set`."
                             );
                         }
                     }
@@ -894,7 +959,24 @@ fn input_key(app: &mut App, k: KeyEvent, db: &mut Db) -> Result<Step> {
 }
 
 fn on_key(app: &mut App, k: KeyEvent, db: &mut Db, cfg: &Config) -> Result<Step> {
-    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    // Alt+key works like Ctrl+key, for when tmux, zellij or an editor's terminal
+    // takes the Ctrl shortcut (^b is tmux's prefix, for example).
+    let ctrl = k
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+    if app.viewer.is_none() && app.input.is_none() && app.editor_pick.is_none() {
+        match k.code {
+            KeyCode::F(1) => {
+                app.help = !app.help;
+                return Ok(Step::Stay);
+            }
+            KeyCode::F(2) => {
+                app.menu = !app.menu;
+                return Ok(Step::Stay);
+            }
+            _ => {}
+        }
+    }
     app.status.clear();
     if app.help {
         app.help = false;
@@ -1156,37 +1238,32 @@ fn draw_menu(f: &mut Frame, app: &App, area: Rect) {
         .target()
         .map(|s| truncate(&s.title(), 44))
         .unwrap_or_else(|| "nothing selected".into());
-    let mut lines = vec![Line::from(Span::styled(target, BOLD)), Line::raw("")];
-    for (key, _, what) in MENU {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!(" {key} "),
-                Style::new()
-                    .fg(th::on_accent())
-                    .bg(th::accent())
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(format!("  {what}")),
-        ]));
-    }
-    lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled("any other key closes", dim())));
-    let h = (lines.len() as u16 + 2).min(area.height);
-    let w = 52.min(area.width);
-    let r = Rect {
-        x: area.x + (area.width - w) / 2,
-        y: area.y + (area.height - h) / 2,
-        width: w,
-        height: h,
-    };
-    f.render_widget(Clear, r);
-    f.render_widget(
-        Paragraph::new(lines).block(
-            Block::bordered()
-                .title(" Actions ")
-                .border_style(Style::new().fg(th::accent())),
-        ),
-        r,
+    let items: Vec<Line<'static>> = MENU
+        .iter()
+        .map(|(key, _, what)| {
+            Line::from(vec![
+                Span::styled(
+                    format!(" {key} "),
+                    Style::new()
+                        .fg(th::on_accent())
+                        .bg(th::accent())
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!("  {what}")),
+            ])
+        })
+        .collect();
+    view::popup(
+        f,
+        area,
+        "Actions",
+        vec![Line::from(Span::styled(target, BOLD)), Line::raw("")],
+        items,
+        vec![
+            Line::raw(""),
+            Line::from(Span::styled("any other key closes", dim())),
+        ],
+        50,
     );
 }
 
@@ -1196,7 +1273,7 @@ fn draw_editor_pick(f: &mut Frame, app: &App, area: Rect) {
     };
     let mut lines = vec![
         Line::from(Span::styled("Open projects with…", BOLD)),
-        Line::from(Span::styled("cctrail remembers your choice", dim())),
+        Line::from(Span::styled("ccrumbs remembers your choice", dim())),
         Line::raw(""),
     ];
     for (i, e) in list.iter().enumerate() {

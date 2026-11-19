@@ -1,8 +1,8 @@
-//! Optional GitHub enrichment through the `gh` CLI (`cctrail sync`).
+//! Optional GitHub enrichment through the `gh` CLI (`ccrumbs sync`).
 //!
 //! Local transcripts show what *your machine's* sessions did. PRs opened by
 //! claude.ai cloud sessions carry a `claude.ai/code/session_…` link in their
-//! body, so syncing PR metadata lets cctrail show those too.
+//! body, so syncing PR metadata lets ccrumbs show those too.
 
 use crate::db::Db;
 use crate::model::PrMeta;

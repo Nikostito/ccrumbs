@@ -1,7 +1,7 @@
-//! `cctrail mcp`: a Model Context Protocol server over stdio, so Claude Code can
+//! `ccrumbs mcp`: a Model Context Protocol server over stdio, so Claude Code can
 //! look things up in your past sessions ("how did we fix the redis bucket last time?").
 //!
-//! Register it with: `claude mcp add cctrail -- cctrail mcp`
+//! Register it with: `claude mcp add ccrumbs -- ccrumbs mcp`
 
 use crate::config::Config;
 use crate::db::Db;
@@ -36,7 +36,7 @@ fn tools() -> Value {
             "description": "Details of one past session: description, prompts the user typed, files edited, PRs (and which other sessions created/reviewed them), tickets, notes, Claude's last reply and the command to resume it.",
             "inputSchema": {
                 "type": "object",
-                "properties": {"id": {"type": "string", "description": "Session id or a unique prefix (8+ chars)."}},
+                "properties": {"id": {"type": "string", "description": "Session id, or a unique prefix of at least 4 characters."}},
                 "required": ["id"]
             }
         },
@@ -105,6 +105,19 @@ fn actor(sessions: &[SessionRow], a: &Actor) -> String {
         Actor::Cloud(c) => format!("claude.ai session https://claude.ai/code/{c}"),
     }
 }
+
+/// Asked for a tool we don't have: a JSON-RPC error (-32602), not a tool result.
+#[derive(Debug)]
+struct UnknownTool(String);
+impl std::fmt::Display for UnknownTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unknown tool: {}", self.0)
+    }
+}
+impl std::error::Error for UnknownTool {}
+
+/// Keep tool results well under clients' output limits (Claude Code warns past ~25k tokens).
+const RESULT_CAP: usize = 40_000;
 
 struct Ctx {
     db: Db,
@@ -323,7 +336,7 @@ impl Ctx {
                     Ok(out)
                 }
             }
-            other => Err(format!("unknown tool {other}")),
+            other => return Err(UnknownTool(other.to_string()).into()),
         })
     }
 }
@@ -353,10 +366,16 @@ pub fn serve(cfg: Config) -> Result<()> {
         db: Db::open()?,
         cfg,
     };
-    let stdin = std::io::stdin();
+    let mut stdin = std::io::stdin().lock();
     let mut out = std::io::stdout().lock();
-    for line in stdin.lock().lines() {
-        let line = line?;
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        // Byte-wise, so invalid UTF-8 is an error reply, not the end of the server.
+        if stdin.read_until(b'\n', &mut buf)? == 0 {
+            return Ok(());
+        }
+        let line = String::from_utf8_lossy(&buf);
         if line.trim().is_empty() {
             continue;
         }
@@ -367,10 +386,18 @@ pub fn serve(cfg: Config) -> Result<()> {
                 continue;
             }
         };
-        let Some(id) = msg.get("id").cloned() else {
+        if msg.is_array() {
+            error(&mut out, &Value::Null, -32600, "batches are not supported")?;
             continue;
-        }; // notifications
-        let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        }
+        // Only requests get answers: notifications have no id, and messages without a
+        // method are the client's responses to us.
+        let (Some(id), Some(method)) = (
+            msg.get("id").cloned(),
+            msg.get("method").and_then(|m| m.as_str()),
+        ) else {
+            continue;
+        };
         let params = msg.get("params").cloned().unwrap_or(Value::Null);
         match method {
             "initialize" => {
@@ -389,7 +416,7 @@ pub fn serve(cfg: Config) -> Result<()> {
                     json!({
                         "protocolVersion": version,
                         "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "cctrail", "version": env!("CARGO_PKG_VERSION")},
+                        "serverInfo": {"name": "ccrumbs", "version": env!("CARGO_PKG_VERSION")},
                         "instructions": "Search the user's past Claude Code sessions. Use search_sessions to find a session (by topic, file, branch, PR or ticket), get_session for its details, read_transcript with a query to see exactly how something was done, and find_pr for which sessions created or reviewed a PR."
                     }),
                 )?;
@@ -399,18 +426,28 @@ pub fn serve(cfg: Config) -> Result<()> {
             "tools/call" => {
                 let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
-                let result = match ctx.call(name, &args) {
-                    Ok(Ok(text)) => {
-                        json!({"content": [{"type": "text", "text": text}], "isError": false})
+                let text_result = |text: String, is_error: bool| {
+                    let mut t = text;
+                    if t.len() > RESULT_CAP {
+                        t = format!(
+                            "{}\n… (cut to fit; ask for less, e.g. read_transcript with a query)",
+                            crate::text::cap_bytes(&t, RESULT_CAP)
+                        );
                     }
-                    Ok(Err(msg)) => {
-                        json!({"content": [{"type": "text", "text": msg}], "isError": true})
-                    }
-                    Err(e) => {
-                        json!({"content": [{"type": "text", "text": format!("cctrail error: {e:#}")}], "isError": true})
-                    }
+                    json!({"content": [{"type": "text", "text": t}], "isError": is_error})
                 };
-                reply(&mut out, &id, result)?;
+                match ctx.call(name, &args) {
+                    Ok(Ok(text)) => reply(&mut out, &id, text_result(text, false))?,
+                    Ok(Err(msg)) => reply(&mut out, &id, text_result(msg, true))?,
+                    Err(e) if e.downcast_ref::<UnknownTool>().is_some() => {
+                        error(&mut out, &id, -32602, &e.to_string())?
+                    }
+                    Err(e) => reply(
+                        &mut out,
+                        &id,
+                        text_result(format!("ccrumbs error: {e:#}"), true),
+                    )?,
+                }
             }
             _ => error(
                 &mut out,
@@ -420,5 +457,4 @@ pub fn serve(cfg: Config) -> Result<()> {
             )?,
         }
     }
-    Ok(())
 }

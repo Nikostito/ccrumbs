@@ -1,7 +1,7 @@
 //! Session descriptions.
 //!
 //! Every session gets a heuristic description at index time (free, instant).
-//! `cctrail describe` can additionally ask Claude for a title + summary,
+//! `ccrumbs describe` can additionally ask Claude for a title + summary,
 //! which is cached in the `ai` table and preferred when present.
 
 use crate::db::Db;

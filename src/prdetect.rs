@@ -25,7 +25,7 @@ static GH_API: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?:^|[;&|(\n`]|\$\()\s*gh\s+api\b([^\n;&|]*)").unwrap());
 static API_PATH: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"repos/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/(pulls|issues)(?:/(\d+))?(?:/(reviews|comments|merge|requested_reviewers|files|commits))?",
+        r"repos/(?:([A-Za-z0-9_.-]+)|\{owner\}|:owner)/(?:([A-Za-z0-9_.-]+)|\{repo\}|:repo)/(pulls|issues)(?:/(\d+))?(?:/(reviews|comments|merge|requested_reviewers|files|commits))?",
     )
     .unwrap()
 });
@@ -33,12 +33,6 @@ static API_WRITE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?:-X|--method)\s*=?\s*(POST|PUT|PATCH)|\s(?:-f|-F|--field|--raw-field|--input)\s")
         .unwrap()
 });
-static REPO_FLAG: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?:-R|--repo)[\s=]+(?:https://github\.com/)?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)")
-        .unwrap()
-});
-static BARE_NUM: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?:^|\s)#?(\d{1,7})(?:\s|$)").unwrap());
 static HASH_NUM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"#(\d{1,7})\b").unwrap());
 static PR_WORD_NUM: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b(?:pr|pull request|pull)\s*#?\s*(\d{1,7})\b").unwrap());
@@ -87,10 +81,13 @@ fn pending(
 pub fn parse_ref(s: &str) -> Option<(Option<String>, u32)> {
     let s = s.trim();
     if let Some(c) = PR_URL.captures(s) {
-        return Some((Some(format!("{}/{}", &c[1], &c[2])), c[3].parse().ok()?));
+        return Some((
+            Some(format!("{}/{}", &c[1], &c[2]).to_lowercase()),
+            c[3].parse().ok()?,
+        ));
     }
     if let Some(c) = REPO_HASH.captures(s) {
-        return Some((Some(c[1].to_string()), c[2].parse().ok()?));
+        return Some((Some(c[1].to_lowercase()), c[2].parse().ok()?));
     }
     let n = s.trim_start_matches('#');
     n.parse().ok().map(|n| (None, n))
@@ -100,16 +97,51 @@ pub fn parse_ref(s: &str) -> Option<(Option<String>, u32)> {
 pub fn urls_in(text: &str) -> Vec<(String, u32)> {
     PR_URL
         .captures_iter(text)
-        .filter_map(|c| Some((format!("{}/{}", &c[1], &c[2]), c[3].parse().ok()?)))
+        .filter(|c| !RESERVED_OWNERS.contains(&c[1].to_lowercase().as_str()))
+        .filter_map(|c| {
+            Some((
+                format!("{}/{}", &c[1], &c[2]).to_lowercase(),
+                c[3].parse().ok()?,
+            ))
+        })
         .collect()
 }
 
 /// `owner/repo` names mentioned as GitHub remotes in text (e.g. `git push` output).
+/// First path parts of github.com URLs that aren't `owner/repo`.
+const RESERVED_OWNERS: &[&str] = &[
+    "user-attachments",
+    "apps",
+    "settings",
+    "orgs",
+    "features",
+    "sponsors",
+    "marketplace",
+    "login",
+    "notifications",
+    "topics",
+    "collections",
+    "explore",
+    "pulls",
+    "issues",
+    "search",
+    "enterprise",
+    "organizations",
+    "about",
+    "pricing",
+    "codespaces",
+    "copilot",
+    "security",
+    "site",
+    "trending",
+    "users",
+];
+
 pub fn repo_hints(text: &str) -> Vec<String> {
     GIT_REMOTE
         .captures_iter(text)
-        .map(|c| format!("{}/{}", &c[1], &c[2]))
-        .filter(|r| !r.ends_with("/pull") && !r.contains("/apps"))
+        .filter(|c| !RESERVED_OWNERS.contains(&c[1].to_lowercase().as_str()))
+        .map(|c| format!("{}/{}", &c[1], &c[2]).to_lowercase())
         .collect()
 }
 
@@ -162,8 +194,10 @@ pub fn from_prompt(prompt: &str) -> Vec<Pending> {
         || prompt.starts_with("/pr-review");
     let mut refs = refs_in_prompt(prompt);
     if is_review_cmd {
-        // `/review 42`, `/code-review high 42 --comment`
-        for (r, n) in prompt.split_whitespace().skip(1).filter_map(parse_ref) {
+        // `/review 42`, `/code-review high 42 --comment`, but not `--max-findings 5`
+        let words = shell_words(prompt);
+        let (pos, _) = positionals(words.get(1..).unwrap_or(&[]));
+        for (r, n) in pos.iter().filter_map(|w| parse_ref(w)) {
             if !refs.iter().any(|(_, m)| *m == n) {
                 refs.push((r, n));
             }
@@ -202,58 +236,187 @@ static HEREDOC: LazyLock<Regex> =
 /// and quoted strings blanked, so `cat <<EOF ... gh pr review 1 ... EOF` or
 /// `echo "gh pr create"` don't count as PR actions.
 pub fn shell_code(cmd: &str) -> String {
-    let mut kept = String::with_capacity(cmd.len());
-    let mut lines = cmd.lines();
+    // Same byte length as `cmd`, so positions found here index into the original:
+    // heredoc bodies and the contents of quoted strings become spaces.
+    let mut mask: Vec<u8> = cmd.as_bytes().to_vec();
+    let mut pos = 0usize;
+    let mut lines = cmd.split_inclusive('\n');
     while let Some(line) = lines.next() {
-        kept.push_str(line);
-        kept.push('\n');
+        let start = pos;
+        pos += line.len();
+        let _ = start;
         for c in HEREDOC.captures_iter(line) {
             let delim = c[1].to_string();
             for body in lines.by_ref() {
-                if body.trim() == delim {
+                let b0 = pos;
+                pos += body.len();
+                let done = body.trim() == delim;
+                if !done {
+                    for m in &mut mask[b0..pos] {
+                        if *m != b'\n' {
+                            *m = b' ';
+                        }
+                    }
+                }
+                if done {
                     break;
                 }
             }
         }
     }
-    let mut out = String::with_capacity(kept.len());
-    let mut quote: Option<char> = None;
-    let mut prev = ' ';
-    for ch in kept.chars() {
+    let mut quote: Option<u8> = None;
+    let mut prev = b' ';
+    for m in mask.iter_mut() {
+        let ch = *m;
         match quote {
-            Some(q) if ch == q && !(q == '"' && prev == '\\') => {
-                quote = None;
-                out.push(ch);
+            Some(q) if ch == q && !(q == b'"' && prev == b'\\') => quote = None,
+            Some(_) => {
+                if ch != b'\n' {
+                    *m = b' ';
+                }
             }
-            Some(_) => {}
-            None if ch == '\'' || ch == '"' => {
-                quote = Some(ch);
-                out.push(ch);
-            }
-            None => out.push(ch),
+            None if ch == b'\'' || ch == b'"' => quote = Some(ch),
+            None => {}
         }
         prev = ch;
     }
+    String::from_utf8(mask).unwrap_or_default()
+}
+
+/// Split shell arguments, honouring quotes and backslashes.
+pub fn shell_words(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut started = false;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some('"'), '\\') => {
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+            }
+            (Some(_), c) => cur.push(c),
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                started = true;
+            }
+            (None, '\\') => {
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                    started = true;
+                }
+            }
+            (None, c) if c.is_whitespace() => {
+                if started || !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            (None, c) => {
+                cur.push(c);
+                started = true;
+            }
+        }
+    }
+    if started || !cur.is_empty() {
+        out.push(cur);
+    }
     out
+}
+
+/// gh flags that take no value. Any other flag is assumed to take one, so the
+/// next word is its value, not a PR number (`--interval 10`, `--max-findings 5`).
+const BOOL_FLAGS: &[&str] = &[
+    "-a",
+    "--approve",
+    "-c",
+    "--comment",
+    "-r",
+    "--request-changes",
+    "-s",
+    "--squash",
+    "-m",
+    "--merge",
+    "--rebase",
+    "-d",
+    "--delete-branch",
+    "--auto",
+    "--admin",
+    "--disable-auto",
+    "-w",
+    "--web",
+    "--watch",
+    "--fail-fast",
+    "--required",
+    "--undo",
+    "--comments",
+    "--patch",
+    "--name-only",
+    "--detach",
+    "-f",
+    "--force",
+    "--recurse-submodules",
+    "--edit-last",
+    "-y",
+    "--yes",
+    "--draft",
+    "--fill",
+    "--dry-run",
+    "--no-maintainer-edit",
+];
+
+/// Positional arguments (flags and their values removed) and the `-R/--repo` value.
+fn positionals(words: &[String]) -> (Vec<String>, Option<String>) {
+    let mut pos = Vec::new();
+    let mut repo = None;
+    let mut i = 0;
+    while i < words.len() {
+        let w = &words[i];
+        if let Some(v) = w.strip_prefix("--repo=") {
+            repo = Some(v.to_string());
+        } else if w == "-R" || w == "--repo" {
+            repo = words.get(i + 1).cloned();
+            i += 1;
+        } else if w.starts_with('-') && w.len() > 1 {
+            if !w.contains('=') && !BOOL_FLAGS.contains(&w.as_str()) {
+                i += 1; // skip the flag's value
+            }
+        } else {
+            pos.push(w.clone());
+        }
+        i += 1;
+    }
+    let repo = repo.map(|r| {
+        r.trim_start_matches("https://github.com/")
+            .trim_end_matches('/')
+            .to_lowercase()
+    });
+    (pos, repo)
 }
 
 /// PR actions in a shell command.
 pub fn from_bash(cmd: &str) -> Vec<Pending> {
     let mut out = Vec::new();
+    // Find commands in the masked text (so heredocs and strings don't count),
+    // then read their arguments from the original, quotes and all.
     let code = shell_code(cmd);
-    let cmd = code.as_str();
-    for c in GH_PR.captures_iter(cmd) {
+    for c in GH_PR.captures_iter(&code) {
         let sub = &c[1];
-        let args = c[2].trim();
-        let repo_flag = REPO_FLAG.captures(args).map(|r| r[1].to_string());
-        let (url_repo, mut number) = match PR_URL.captures(args) {
-            Some(u) => (Some(format!("{}/{}", &u[1], &u[2])), u[3].parse().ok()),
-            None => (None, None),
-        };
-        if number.is_none() && !matches!(sub, "create" | "new") {
-            // First bare positional number, ignoring flag values like `--limit 5`.
-            let stripped = strip_flag_values(args);
-            number = BARE_NUM.captures(&stripped).and_then(|m| m[1].parse().ok());
+        let span = c.get(2).unwrap().range();
+        let words = shell_words(cmd.get(span).unwrap_or(""));
+        let (pos, repo_flag) = positionals(&words);
+        let mut repo = repo_flag;
+        let mut number = None;
+        if !matches!(sub, "create" | "new") {
+            if let Some(first) = pos.first() {
+                if let Some((r, n)) = parse_ref(first) {
+                    repo = repo.or(r);
+                    number = Some(n);
+                }
+            }
         }
         let role = match sub {
             "create" | "new" => Role::Created,
@@ -263,19 +426,19 @@ pub fn from_bash(cmd: &str) -> Vec<Pending> {
             "checkout" | "co" | "edit" | "ready" | "close" | "reopen" => Role::WorkedOn,
             _ => Role::Viewed,
         };
-        out.push(pending(
-            repo_flag.or(url_repo),
-            number,
-            role,
-            format!("gh pr {sub}"),
-        ));
+        out.push(pending(repo, number, role, format!("gh pr {sub}")));
     }
-    for c in GH_API.captures_iter(cmd) {
-        let args = &c[1];
+    for c in GH_API.captures_iter(&code) {
+        let span = c.get(1).unwrap().range();
+        let args = cmd.get(span).unwrap_or("");
         let Some(p) = API_PATH.captures(args) else {
             continue;
         };
-        let repo = Some(format!("{}/{}", &p[1], &p[2]));
+        // `{owner}/{repo}` and `:owner/:repo` mean "the current repo".
+        let repo = match (p.get(1), p.get(2)) {
+            (Some(o), Some(r)) => Some(format!("{}/{}", o.as_str(), r.as_str()).to_lowercase()),
+            _ => None,
+        };
         let kind = &p[3];
         let number: Option<u32> = p.get(4).and_then(|m| m.as_str().parse().ok());
         let tail = p.get(5).map(|m| m.as_str());
@@ -295,54 +458,6 @@ pub fn from_bash(cmd: &str) -> Vec<Pending> {
     out
 }
 
-fn strip_flag_values(args: &str) -> String {
-    let mut out = Vec::new();
-    let mut skip = false;
-    for tok in args.split_whitespace() {
-        if skip {
-            skip = false;
-            continue;
-        }
-        if tok.starts_with('-') {
-            // Flags that take a value: skip the value too.
-            if !tok.contains('=')
-                && matches!(
-                    tok,
-                    "-R" | "--repo"
-                        | "-b"
-                        | "--body"
-                        | "-t"
-                        | "--title"
-                        | "-B"
-                        | "--base"
-                        | "-H"
-                        | "--head"
-                        | "-L"
-                        | "--limit"
-                        | "-F"
-                        | "--body-file"
-                        | "-s"
-                        | "--state"
-                        | "--json"
-                        | "-q"
-                        | "--jq"
-                        | "-T"
-                        | "--template"
-                        | "-l"
-                        | "--label"
-                        | "-a"
-                        | "--assignee"
-                )
-            {
-                skip = true;
-            }
-            continue;
-        }
-        out.push(tok);
-    }
-    out.join(" ")
-}
-
 /// PR actions in an MCP / built-in tool call (`name` already stripped of `mcp__server__`).
 pub fn from_tool(base: &str, input: &Value) -> Vec<Pending> {
     let s = |k: &str| input.get(k).and_then(|v| v.as_str()).map(str::to_string);
@@ -353,7 +468,7 @@ pub fn from_tool(base: &str, input: &Value) -> Vec<Pending> {
         })
     };
     let repo = match (s("owner"), s("repo")) {
-        (Some(o), Some(r)) => Some(format!("{o}/{r}")),
+        (Some(o), Some(r)) => Some(format!("{o}/{r}").to_lowercase()),
         _ => None,
     };
     let number = n("pullNumber")
@@ -413,7 +528,21 @@ pub fn from_tool(base: &str, input: &Value) -> Vec<Pending> {
 }
 
 /// Fill in a missing PR number (and repo) from the tool's output.
+static ISSUE_URL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/(\d+)").unwrap()
+});
+
 pub fn complete(mut p: Pending, result: &str) -> Option<Pending> {
+    // Commenting on an issue (not a PR) shares the tools and numbering; the result
+    // URL tells them apart.
+    if urls_in(result).is_empty() {
+        if let Some(c) = ISSUE_URL.captures(result) {
+            let n: Option<u32> = c[1].parse().ok();
+            if p.number.is_none() || p.number == n {
+                return None;
+            }
+        }
+    }
     if p.number.is_none() || p.role == Role::Created {
         if let Some((r, n)) = urls_in(result).into_iter().next() {
             p.repo = p.repo.or(Some(r));
@@ -421,7 +550,7 @@ pub fn complete(mut p: Pending, result: &str) -> Option<Pending> {
         } else if p.number.is_none() {
             // e.g. "✓ Merged pull request owner/repo#12" or JSON {"number": 12}
             if let Some(c) = REPO_HASH.captures(result) {
-                p.repo = p.repo.or(Some(c[1].to_string()));
+                p.repo = p.repo.or(Some(c[1].to_lowercase()));
                 p.number = c[2].parse().ok();
             } else if let Some(c) = JSON_NUMBER.captures(result) {
                 p.number = c[1].parse().ok();
@@ -519,6 +648,63 @@ mod tests {
             from_bash("URL=$(gh pr create --title 'a b' --body \"c\")")[0].role,
             Role::Created
         );
+    }
+
+    #[test]
+    fn placeholders_quotes_and_flag_values() {
+        let p = from_bash("gh api repos/{owner}/{repo}/pulls/44/reviews -X POST -f event=COMMENT");
+        assert_eq!(
+            (p[0].role, p[0].number, p[0].repo.clone()),
+            (Role::Reviewed, Some(44), None)
+        );
+        let p = from_bash("gh pr view \"https://github.com/Acme/API/pull/45\"");
+        assert_eq!(
+            (p[0].number, p[0].repo.as_deref()),
+            (Some(45), Some("acme/api"))
+        );
+        let p = from_bash("gh pr review 12 --body \"fixes #3 and #4\" --approve");
+        assert_eq!(p[0].number, Some(12));
+        assert_eq!(
+            from_bash("gh pr checks --watch --interval 10")[0].number,
+            None
+        );
+        assert!(from_prompt("/code-review high --max-findings 5").is_empty());
+        assert_eq!(
+            from_prompt("/code-review high 42 --comment")[0].number,
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn issues_are_not_prs() {
+        let p = from_tool(
+            "add_issue_comment",
+            &json!({"owner":"o","repo":"x","issue_number":99}),
+        );
+        assert!(
+            complete(
+                p[0].clone(),
+                r#"{"html_url":"https://github.com/o/x/issues/99#issuecomment-1"}"#
+            )
+            .is_none()
+        );
+        let p = from_tool(
+            "add_issue_comment",
+            &json!({"owner":"o","repo":"x","issue_number":7}),
+        );
+        assert!(
+            complete(
+                p[0].clone(),
+                r#"{"html_url":"https://github.com/o/x/pull/7#issuecomment-1"}"#
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn reserved_github_paths_are_not_repos() {
+        assert!(urls_in("see https://github.com/user-attachments/assets/pull/21").is_empty());
+        assert!(repo_hints("https://github.com/settings/tokens ").is_empty());
     }
 
     #[test]

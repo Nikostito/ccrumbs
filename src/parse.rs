@@ -14,7 +14,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::LazyLock;
 
-const FULLTEXT_CAP: usize = 400_000;
+const FULLTEXT_CAP: usize = 150_000;
 const KEEP_PROMPTS: usize = 12;
 
 static TEST_CMD: LazyLock<Regex> = LazyLock::new(|| {
@@ -34,6 +34,20 @@ struct State {
     cur_ts: Option<String>,
     /// Final `totalCostUSD` per Claude Code process run (keyed by its start time).
     cost_runs: HashMap<i64, f64>,
+    /// Compactions: Claude Code writes a `compact_boundary` record and then a summary
+    /// message; count boundaries, and summaries only for older files without them.
+    boundaries: u32,
+    summaries: u32,
+}
+
+/// Session ids are file names; they end up in shell commands, so only accept the
+/// plain UUID-like names Claude Code writes.
+pub fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 80
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// Parse a session transcript plus any subagent transcripts stored beside it.
@@ -43,6 +57,9 @@ pub fn parse_session(
     extra: &[std::path::PathBuf],
 ) -> Option<ParsedSession> {
     let id = path.file_stem()?.to_string_lossy().to_string();
+    if !valid_id(&id) {
+        return None;
+    }
     let mut st = State::default();
     st.s.id = id;
     st.s.path = path.to_string_lossy().to_string();
@@ -60,6 +77,14 @@ pub fn parse_session(
         }
     }
     st.s.cost_usd = st.cost_runs.values().sum();
+    st.s.compactions = if st.boundaries > 0 {
+        st.boundaries
+    } else {
+        st.summaries
+    };
+    for l in &mut st.links {
+        l.repo = l.repo.to_lowercase();
+    }
     let mut cands: Vec<crate::tickets::Candidate> = Vec::new();
     if let Some(b) = &st.s.branch {
         for key in crate::tickets::from_branch(b) {
@@ -154,14 +179,16 @@ fn handle(v: &Value, st: &mut State, sidechain_file: bool) {
         }
     }
 
-    if !sidechain_file
-        && (v
+    if !sidechain_file {
+        if ty == "system" && str_of(v, "subtype") == Some("compact_boundary") {
+            st.boundaries += 1;
+        } else if v
             .get("isCompactSummary")
             .and_then(|x| x.as_bool())
             .unwrap_or(false)
-            || (ty == "system" && str_of(v, "subtype") == Some("compact_boundary")))
-    {
-        st.s.compactions += 1;
+        {
+            st.summaries += 1;
+        }
     }
 
     match ty {
@@ -388,11 +415,16 @@ fn handle_tool_use(b: &Value, st: &mut State) {
         "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => {
             let f = str_of(&input, "file_path").or_else(|| str_of(&input, "notebook_path"));
             if let Some(f) = f {
+                // Relative to the session directory, but only at a path boundary:
+                // `/x/api-gateway/a.rs` is not inside `/x/api`.
                 let rel = match &st.s.cwd {
-                    Some(cwd) => f
-                        .strip_prefix(cwd.as_str())
-                        .map(|r| r.trim_start_matches('/'))
-                        .unwrap_or(f),
+                    Some(cwd) => {
+                        let base = cwd.trim_end_matches(['/', '\\']);
+                        f.strip_prefix(base)
+                            .and_then(|r| r.strip_prefix('/').or_else(|| r.strip_prefix('\\')))
+                            .filter(|r| !r.is_empty())
+                            .unwrap_or(f)
+                    }
                     None => f,
                 };
                 if st.files_seen.insert(rel.to_string()) {
@@ -424,7 +456,7 @@ mod tests {
 
     #[test]
     fn context_cost_and_compactions() {
-        let dir = std::env::temp_dir().join(format!("cctrail-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ccrumbs-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("s1.jsonl");
         let lines = [
@@ -433,6 +465,7 @@ mod tests {
             r#"{"type":"cost-state","totalCostUSD":1.5,"startTime":1}"#,
             r#"{"type":"cost-state","totalCostUSD":2.5,"startTime":1}"#,
             r#"{"type":"system","subtype":"compact_boundary","timestamp":"2026-01-01T00:00:02Z"}"#,
+            r#"{"type":"user","isCompactSummary":true,"message":{"role":"user","content":"summary of the earlier part"}}"#,
             r#"{"type":"assistant","timestamp":"2026-01-01T00:00:03Z","message":{"id":"m2","model":"claude-opus-5-5","content":[{"type":"text","text":"b"}],"usage":{"input_tokens":5,"cache_read_input_tokens":40000,"output_tokens":5}}}"#,
             r#"{"type":"assistant","isSidechain":true,"message":{"id":"m3","content":[],"usage":{"input_tokens":900000}}}"#,
             r#"{"type":"cost-state","totalCostUSD":0.75,"startTime":2}"#,
@@ -443,5 +476,30 @@ mod tests {
         assert_eq!(s.context_tokens, 40010); // latest main-thread reply, not the subagent
         assert_eq!(s.compactions, 1);
         assert!((s.cost_usd - 3.25).abs() < 1e-9); // last value per run, summed
+    }
+
+    #[test]
+    fn edited_paths_are_trimmed_at_a_boundary_only() {
+        let dir = std::env::temp_dir().join(format!("ccrumbs-test-paths-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("s2.jsonl");
+        let lines = [
+            r#"{"type":"user","cwd":"/home/u/api","message":{"role":"user","content":"edit"}}"#,
+            r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"/home/u/api/src/a.rs"}},{"type":"tool_use","id":"t2","name":"Edit","input":{"file_path":"/home/u/api-gateway/src/x.rs"}}]}}"#,
+        ];
+        std::fs::write(&f, lines.join("\n")).unwrap();
+        let s = parse_session(&f, "p", &[]).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            s.files_edited,
+            vec!["src/a.rs", "/home/u/api-gateway/src/x.rs"]
+        );
+    }
+
+    #[test]
+    fn rejects_unsafe_ids() {
+        assert!(valid_id("ab3b84ec-75e5-5c62-b5e5-5a44ead9213b"));
+        assert!(!valid_id("x;touch${IFS}pwned"));
+        assert!(!valid_id("a b"));
     }
 }

@@ -1,4 +1,4 @@
-//! cctrail — find a Claude Code session fast, see what it did, and which PRs it
+//! ccrumbs — find a Claude Code session fast, see what it did, and which PRs it
 //! created or reviewed, then jump straight back into it.
 
 mod config;
@@ -32,7 +32,7 @@ use text::{age, duration, home_short, local_time, truncate};
 
 #[derive(Parser)]
 #[command(
-    name = "cctrail",
+    name = "ccrumbs",
     version,
     about = "Find, understand and resume your Claude Code sessions — and the PRs they created or reviewed."
 )]
@@ -46,13 +46,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Open the picker (default). Optional initial query, e.g. `cctrail pick #42`.
+    /// Open the picker (default). Optional initial query, e.g. `ccrumbs pick #42`.
     Pick {
         query: Vec<String>,
         /// Print the resume command instead of running it.
         #[arg(long)]
         print: bool,
-        /// Print the session's directory (for `cd "$(cctrail pick --print-dir)"`).
+        /// Print the session's directory (for `cd "$(ccrumbs pick --print-dir)"`).
         #[arg(long, conflicts_with = "print")]
         print_dir: bool,
     },
@@ -69,8 +69,12 @@ enum Cmd {
         /// Output file; `-` for stdout. Default: ./<id>-<title>.md
         #[arg(short, long)]
         output: Option<String>,
+        /// Include tool output (shell results, file reads...).
         #[arg(long)]
         outputs: bool,
+        /// Overwrite the output file if it exists.
+        #[arg(short, long)]
+        force: bool,
     },
     /// Open a session's PR, ticket or claude.ai page in the browser.
     /// Target: session id, PR ref (#42, owner/repo#42) or ticket key (ABC-123).
@@ -105,7 +109,7 @@ enum Cmd {
     Unhide {
         id: String,
     },
-    /// Open a session's project in your editor (see `cctrail editor`).
+    /// Open a session's project in your editor (see `ccrumbs editor`).
     Edit {
         id: String,
     },
@@ -114,17 +118,17 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<EditorCmd>,
     },
-    /// Print a session's directory: `cd "$(cctrail dir a1b2)"`.
+    /// Print a session's directory: `cd "$(ccrumbs dir a1b2)"`.
     Dir {
         id: String,
     },
-    /// Print shell integration (key binding + `ccd`): eval "$(cctrail shell-init zsh)".
+    /// Print shell integration (key binding + `ccd`): eval "$(ccrumbs shell-init zsh)".
     ShellInit {
         #[arg(value_parser = ["zsh", "bash", "fish"])]
         shell: String,
     },
     /// Run an MCP server so Claude Code can search your past sessions:
-    /// `claude mcp add cctrail -- cctrail mcp`.
+    /// `claude mcp add ccrumbs -- ccrumbs mcp`.
     Mcp,
     /// Jump straight into the best match; opens the picker if it's ambiguous.
     /// With no query, continues the latest session from the repo/branch you're in.
@@ -240,15 +244,15 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum EditorCmd {
-    /// `cctrail editor set cursor`, `set pycharm`, or any command: `set "code -n"`.
+    /// `ccrumbs editor set cursor`, `set pycharm`, or any command: `set "code -n"`.
     Set { editor: Vec<String> },
-    /// Forget the choice; cctrail asks again next time.
+    /// Forget the choice; ccrumbs asks again next time.
     Reset,
 }
 
 #[derive(Subcommand)]
 enum TicketsCmd {
-    /// `cctrail tickets set ABC https://acme.atlassian.net` (any ticket URL works too).
+    /// `ccrumbs tickets set ABC https://acme.atlassian.net` (any ticket URL works too).
     /// With only a URL, it's used for every prefix.
     Set {
         /// Ticket prefix (ABC for ABC-123), or the URL to use for all prefixes.
@@ -295,7 +299,7 @@ fn main() {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
     if let Err(e) = real_main() {
-        eprintln!("cctrail: {e:#}");
+        eprintln!("ccrumbs: {e:#}");
         std::process::exit(1);
     }
 }
@@ -382,6 +386,7 @@ fn real_main() -> Result<()> {
             id,
             output,
             outputs,
+            force,
         } => {
             let sessions = db.load_sessions()?;
             let s = one(&sessions, &id)?;
@@ -392,6 +397,9 @@ fn real_main() -> Result<()> {
                     let path = o
                         .map(str::to_string)
                         .unwrap_or_else(|| transcript::file_name(s));
+                    if std::path::Path::new(&path).exists() && !force {
+                        bail!("{path} already exists (use --force to overwrite)");
+                    }
                     std::fs::write(&path, md)?;
                     eprintln!("Wrote {path}");
                 }
@@ -436,7 +444,7 @@ fn real_main() -> Result<()> {
             let s = one(&sessions, &id)?;
             let Some(ed) = launch::chosen_editor(cfg.editor.as_deref()) else {
                 bail!(
-                    "no editor chosen yet: run `cctrail editor` to see what's installed, then `cctrail editor set <name>`"
+                    "no editor chosen yet: run `ccrumbs editor` to see what's installed, then `ccrumbs editor set <name>`"
                 );
             };
             let (mut cmd, gui) = launch::editor_command(&ed, &s.resume_dir())?;
@@ -530,7 +538,7 @@ fn real_main() -> Result<()> {
             }
             if n == 0 {
                 println!(
-                    "No PRs found. Sessions that run `gh pr create/review` or GitHub MCP tools show up here; `cctrail sync` adds PRs opened from claude.ai."
+                    "No PRs found. Sessions that run `gh pr create/review` or GitHub MCP tools show up here; `ccrumbs sync` adds PRs opened from claude.ai."
                 );
             }
             Ok(())
@@ -598,7 +606,7 @@ fn config_cmd(cmd: Cmd, cfg: &mut Config) -> Result<()> {
             }
             cfg.save()?;
             println!(
-                "Ignoring projects matching {pattern:?} (run `cctrail index --full` to drop already-indexed ones)"
+                "Ignoring projects matching {pattern:?} (run `ccrumbs index --full` to drop already-indexed ones)"
             );
         }
         Cmd::Unignore { pattern } => {
@@ -631,7 +639,9 @@ fn pick(db: &mut Db, cfg: &Config, query: &str) -> Result<()> {
 fn pick_mode(db: &mut Db, cfg: &Config, query: &str, mode: PickMode) -> Result<()> {
     // The picker draws on stderr, so stdout may be captured by `$(...)`.
     if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
-        bail!("the picker needs a terminal; try `cctrail list` or `cctrail go <query> --print`");
+        bail!(
+            "the picker needs a terminal; `ccrumbs list <query>` shows matches, `ccrumbs resume <id> --print` prints a command"
+        );
     }
     match (tui::run(db, cfg, query)?, mode) {
         (tui::Outcome::Resume(s), PickMode::Resume) => launch::resume_here(&s),
@@ -652,7 +662,7 @@ fn editor_cmd(p: &Paint, cmd: Option<EditorCmd>) -> Result<()> {
         Some(EditorCmd::Set { editor }) => {
             let wanted = editor.join(" ");
             if wanted.trim().is_empty() {
-                bail!("say which editor, e.g. `cctrail editor set cursor`");
+                bail!("say which editor, e.g. `ccrumbs editor set cursor`");
             }
             let command = launch::resolve_editor(&wanted);
             config::set_editor(Some(&command))?;
@@ -667,7 +677,7 @@ fn editor_cmd(p: &Paint, cmd: Option<EditorCmd>) -> Result<()> {
             match &current {
                 Some(c) => println!("Projects open with: {}", p.bold(c)),
                 None => println!(
-                    "No editor chosen yet: Ctrl-E in the picker asks, or use `cctrail editor set <name>`."
+                    "No editor chosen yet: Ctrl-E in the picker asks, or use `ccrumbs editor set <name>`."
                 ),
             }
             let found = launch::detect_editors();
@@ -737,8 +747,8 @@ fn tickets_cmd(p: &Paint, db: &Db, cmd: Option<TicketsCmd>) -> Result<()> {
             let links = config::ticket_templates();
             if links.is_empty() {
                 println!("No ticket links yet. Set one with:");
-                println!("  cctrail tickets set ABC https://yourcompany.atlassian.net");
-                println!("  cctrail tickets set ENG https://linear.app/yourteam");
+                println!("  ccrumbs tickets set ABC https://yourcompany.atlassian.net");
+                println!("  ccrumbs tickets set ENG https://linear.app/yourteam");
             } else {
                 println!("{}", p.bold("Ticket links"));
                 for (k, v) in &links {
@@ -759,7 +769,7 @@ fn tickets_cmd(p: &Paint, db: &Db, cmd: Option<TicketsCmd>) -> Result<()> {
                     let status = if linked {
                         p.c("32", "linked")
                     } else {
-                        p.c("33", format!("no link: cctrail tickets set {k} <url>"))
+                        p.c("33", format!("no link: ccrumbs tickets set {k} <url>"))
                     };
                     println!(
                         "  {k:<6} {n:>3} session{}  {status}",
@@ -775,32 +785,32 @@ fn tickets_cmd(p: &Paint, db: &Db, cmd: Option<TicketsCmd>) -> Result<()> {
 fn shell_init(shell: &str) -> String {
     match shell {
         "fish" => {
-            r#"# cctrail: add to ~/.config/fish/config.fish:  cctrail shell-init fish | source
+            r#"# ccrumbs: add to ~/.config/fish/config.fish:  ccrumbs shell-init fish | source
 # Alt-S opens the session picker from any prompt.
-bind \es 'cctrail </dev/tty; commandline -f repaint'
+bind \es 'ccrumbs </dev/tty; commandline -f repaint'
 # ccd [query]: pick a session and cd into its directory.
 function ccd
-    set -l d (cctrail pick --print-dir $argv)
+    set -l d (ccrumbs pick --print-dir $argv)
     and test -n "$d"
     and cd $d
 end
 "#
             .into()
         }
-        "bash" => r#"# cctrail: add to ~/.bashrc:  eval "$(cctrail shell-init bash)"
+        "bash" => r#"# ccrumbs: add to ~/.bashrc:  eval "$(ccrumbs shell-init bash)"
 # Alt-S opens the session picker from any prompt.
-bind -x '"\es": cctrail </dev/tty'
+bind -x '"\es": ccrumbs </dev/tty'
 # ccd [query]: pick a session and cd into its directory.
-ccd() { local d; d="$(cctrail pick --print-dir "$@")" && [ -n "$d" ] && cd "$d"; }
+ccd() { local d; d="$(ccrumbs pick --print-dir "$@")" && [ -n "$d" ] && cd "$d"; }
 "#
         .into(),
-        _ => r#"# cctrail: add to ~/.zshrc:  eval "$(cctrail shell-init zsh)"
+        _ => r#"# ccrumbs: add to ~/.zshrc:  eval "$(ccrumbs shell-init zsh)"
 # Alt-S opens the session picker from any prompt.
-_cctrail_pick() { cctrail </dev/tty; zle reset-prompt; }
-zle -N _cctrail_pick
-bindkey '\es' _cctrail_pick
+_ccrumbs_pick() { ccrumbs </dev/tty; zle reset-prompt; }
+zle -N _ccrumbs_pick
+bindkey '\es' _ccrumbs_pick
 # ccd [query]: pick a session and cd into its directory.
-ccd() { local d; d="$(cctrail pick --print-dir "$@")" && [ -n "$d" ] && cd "$d"; }
+ccd() { local d; d="$(ccrumbs pick --print-dir "$@")" && [ -n "$d" ] && cd "$d"; }
 "#
         .into(),
     }
@@ -818,7 +828,7 @@ fn open_cmd(db: &Db, target: &str, pr: bool, ticket: bool, cloud: bool, print: b
     let ticket_url = |k: &str| {
         config::ticket_url(k).ok_or_else(|| {
             anyhow::anyhow!(
-                "no link set for {k} tickets yet: cctrail tickets set {} <your Jira or Linear URL>",
+                "no link set for {k} tickets yet: ccrumbs tickets set {} <your Jira or Linear URL>",
                 tickets::prefix(k)
             )
         })
@@ -907,6 +917,7 @@ fn go(db: &mut Db, cfg: &Config, query: &str, print: bool) -> Result<()> {
                 );
                 run(s)
             }
+            None if print => pick_mode(db, cfg, "", PickMode::Cmd),
             None => pick(db, cfg, ""),
         };
     }
@@ -957,15 +968,29 @@ fn go(db: &mut Db, cfg: &Config, query: &str, print: bool) -> Result<()> {
     if hits.len() == 1 {
         return run(&sessions[hits[0]]);
     }
+    if hits.is_empty() {
+        bail!("no session matches {query:?}");
+    }
+    if print && std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+        // Let the user choose; print the choice (stdout stays a single command).
+        return pick_mode(db, cfg, query, PickMode::Cmd);
+    }
     if print || !std::io::stdout().is_terminal() {
-        let p = Paint(false);
+        // Ambiguous: list the candidates on stderr, so `$(ccrumbs go … --print)`
+        // never captures anything but a command.
         for &i in hits.iter().take(10) {
-            print_row(&p, &sessions[i], false);
+            let s = &sessions[i];
+            eprintln!(
+                "  {}  {:>4}  {}",
+                s.short_id(),
+                text::age(s.ended.as_deref()),
+                text::truncate(&s.title(), 80)
+            );
         }
-        if hits.is_empty() {
-            bail!("no session matches {query:?}");
-        }
-        return Ok(());
+        bail!(
+            "{} sessions match {query:?}; add words or use an id",
+            hits.len()
+        );
     }
     pick(db, cfg, query)
 }
@@ -973,6 +998,7 @@ fn go(db: &mut Db, cfg: &Config, query: &str, print: bool) -> Result<()> {
 fn one<'a>(sessions: &'a [SessionRow], id: &str) -> Result<&'a SessionRow> {
     let m = search::by_id(sessions, id);
     match m.len() {
+        0 if id.trim().len() < 4 => bail!("give at least 4 characters of the session id"),
         0 => bail!("no session with id starting {id:?}"),
         1 => Ok(m[0]),
         n => bail!("{n} sessions start with {id:?} — use more characters"),
@@ -1309,7 +1335,7 @@ fn pr_cmd(p: &Paint, db: &Db, q: &str, sync: bool) -> Result<()> {
         hits = prview::lookup(&prs, q).into_iter().cloned().collect();
     }
     if hits.is_empty() {
-        bail!("no session touched PR {q:?} (try `cctrail pr {q} --sync` or `cctrail sync`)");
+        bail!("no session touched PR {q:?} (try `ccrumbs pr {q} --sync` or `ccrumbs sync`)");
     }
     for (i, e) in hits.iter().enumerate() {
         if i > 0 {
@@ -1385,7 +1411,7 @@ fn pr_cmd(p: &Paint, db: &Db, q: &str, sync: bool) -> Result<()> {
             println!();
             println!(
                 "Jump in: {}",
-                p.bold(format!("cctrail go {}", sessions[i].short_id()))
+                p.bold(format!("ccrumbs go {}", sessions[i].short_id()))
             );
         }
     }

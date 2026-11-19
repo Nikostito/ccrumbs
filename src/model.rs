@@ -200,12 +200,7 @@ impl SessionRow {
     }
 
     pub fn project_name(&self) -> String {
-        let dir = self.resume_dir();
-        dir.trim_end_matches('/')
-            .rsplit('/')
-            .next()
-            .unwrap_or(&dir)
-            .to_string()
+        crate::text::file_name(&self.resume_dir()).to_string()
     }
 
     /// One entry per PR: the strongest role, plus the other roles this session had on it.
@@ -275,7 +270,7 @@ impl SessionRow {
     }
 }
 
-/// PR metadata pulled from GitHub by `cctrail sync`.
+/// PR metadata pulled from GitHub by `ccrumbs sync`.
 #[derive(Debug, Clone, Default)]
 pub struct PrMeta {
     pub repo: String,

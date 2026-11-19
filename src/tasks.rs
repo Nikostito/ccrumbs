@@ -80,7 +80,8 @@ pub fn build(sessions: &[SessionRow], prs: &[PrEntry]) -> (Vec<Task>, Vec<Option
                 l.role,
                 Role::Created | Role::Reviewed | Role::Merged | Role::Commented | Role::WorkedOn
             );
-            if let (true, Some(i)) = (concrete, l.session) {
+            // A bare `#3` with no known repo could be any project's PR 3: don't join on it.
+            if let (true, Some(i), false) = (concrete, l.session, e.repo.is_empty()) {
                 join(
                     &mut dsu,
                     format!("pr|{}|{}", e.repo.to_lowercase(), e.number),
@@ -166,9 +167,12 @@ pub fn build(sessions: &[SessionRow], prs: &[PrEntry]) -> (Vec<Task>, Vec<Option
 /// `WEB-142: dark mode` from the key and a branch like `feature/WEB-142-dark-mode`.
 fn ticket_title(key: &str, branch: Option<&str>) -> String {
     let rest = branch.and_then(|b| {
-        let lb = b.to_lowercase();
-        let at = lb.find(&key.to_lowercase())?;
-        let tail = b[at + key.len()..].trim_matches(|c: char| c == '-' || c == '_' || c == '/');
+        // ASCII-only case folding keeps byte offsets valid in `b` (to_lowercase can
+        // change byte lengths, e.g. for `İ`).
+        let at = b.to_ascii_lowercase().find(&key.to_ascii_lowercase())?;
+        let tail = b
+            .get(at + key.len()..)?
+            .trim_matches(|c: char| c == '-' || c == '_' || c == '/');
         (!tail.is_empty()).then(|| tail.replace(['-', '_', '/'], " "))
     });
     match rest {
