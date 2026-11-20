@@ -322,6 +322,8 @@ struct App {
     /// Session that's already open elsewhere, and the key that opens a second copy
     /// when pressed again.
     confirm_again: Option<(String, Action)>,
+    /// When running `claude` processes were last looked for.
+    live_checked: std::time::Instant,
     /// Background PR status refresh: (PRs updated, first error).
     refresh: Option<std::sync::mpsc::Receiver<(usize, Option<String>)>>,
 }
@@ -397,6 +399,7 @@ impl App {
             help: false,
             editor_pick: None,
             confirm_again: None,
+            live_checked: std::time::Instant::now(),
             refresh: None,
         };
         app.reload(db)?;
@@ -597,8 +600,14 @@ fn event_loop(term: &mut Term, app: &mut App, db: &mut Db, cfg: &Config) -> Resu
     loop {
         refresh_done(app, db);
         term.draw(|f| draw(f, app))?;
-        // While the PR check runs, wake up now and then to show its result.
-        if app.refresh.is_some() && !event::poll(std::time::Duration::from_millis(300))? {
+        // Wake up now and then: to show the PR check's result while it runs, and to
+        // notice sessions opened or closed in other terminals.
+        let wait = if app.refresh.is_some() { 300 } else { 1000 };
+        if !event::poll(std::time::Duration::from_millis(wait))? {
+            let busy = app.viewer.is_some() || app.input.is_some() || app.menu;
+            if !busy && app.live_checked.elapsed() >= std::time::Duration::from_secs(3) {
+                app.refresh_live(db);
+            }
             continue;
         }
         let k = match event::read()? {
@@ -699,6 +708,39 @@ impl App {
     }
 
     /// Reload after changing marks, keeping the selection where it was.
+    /// Look for running `claude` processes again; re-sort the list if that changed
+    /// which sessions are open, keeping the selection.
+    fn refresh_live(&mut self, db: &Db) {
+        let snapshot = |sessions: &[SessionRow]| -> Vec<(usize, u32)> {
+            sessions
+                .iter()
+                .enumerate()
+                .filter_map(|(i, s)| s.live.as_ref().map(|l| (i, l.pid)))
+                .collect()
+        };
+        let before = snapshot(&self.sessions);
+        crate::live::annotate(&mut self.sessions);
+        self.live_checked = std::time::Instant::now();
+        if snapshot(&self.sessions) != before {
+            let id = self.selected().map(|s| s.id.clone());
+            let (t, p, scroll) = (
+                self.task_list.selected(),
+                self.pr_list.selected(),
+                self.preview_scroll,
+            );
+            self.refilter(db);
+            if let Some(pos) =
+                id.and_then(|id| self.shown.iter().position(|&i| self.sessions[i].id == id))
+            {
+                self.list.select(Some(pos));
+                self.preview_scroll = scroll;
+            }
+            self.task_list
+                .select(t.filter(|&i| i < self.task_shown.len()));
+            self.pr_list.select(p.filter(|&i| i < self.pr_shown.len()));
+        }
+    }
+
     fn reload_keep(&mut self, db: &Db) -> Result<()> {
         let (a, b, c) = (
             self.list.selected(),
@@ -737,7 +779,7 @@ fn act(
 ) -> Result<Step> {
     if a == Action::NewTab
         && let Some(s) = app.target().cloned()
-        && let Some(step) = already_open(app, &s, a, confirm)
+        && let Some(step) = already_open(app, db, &s, a, confirm)
     {
         return Ok(step);
     }
@@ -1060,10 +1102,15 @@ fn input_key(app: &mut App, k: KeyEvent, db: &mut Db) -> Result<Step> {
 /// running claude, switch there instead. Returns the step to take, or None to go on.
 fn already_open(
     app: &mut App,
+    db: &Db,
     s: &SessionRow,
     action: Action,
     confirm: &Option<(String, Action)>,
 ) -> Option<Step> {
+    s.live.as_ref()?;
+    // The marks can be a few seconds old: check again before switching to it.
+    app.refresh_live(db);
+    let s = app.sessions.iter().find(|x| x.id == s.id)?.clone();
     let live = s.live.as_ref()?;
     if confirm
         .as_ref()
@@ -1169,7 +1216,7 @@ fn on_key(
                 if let Some(s) = app.selected().cloned() {
                     if s.missing {
                         app.status = "This transcript was deleted by Claude Code's retention; it can't be resumed.".into();
-                    } else if let Some(step) = already_open(app, &s, Action::Resume, &confirm) {
+                    } else if let Some(step) = already_open(app, db, &s, Action::Resume, &confirm) {
                         return Ok(step);
                     } else {
                         return Ok(Step::Exit(Outcome::Resume(Box::new(s))));

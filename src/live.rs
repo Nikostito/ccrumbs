@@ -176,9 +176,101 @@ fn cwds(pids: &[u32]) -> std::collections::HashMap<u32, String> {
     out
 }
 
-/// Mark the sessions that are open in a running `claude`. Cheap enough to run on
-/// every load (one `ps`, and `/proc` or one `lsof`).
+/// What matching needs to know about a running `claude`.
+struct Running {
+    pid: u32,
+    tty: String,
+    /// Seconds since it started.
+    age: i64,
+    /// `--resume <id>` from its command line. Only a hint: `/clear` or `/resume`
+    /// inside Claude switches session without changing the command line.
+    resumed: Option<String>,
+    dir: Option<String>,
+}
+
+/// Which session each running `claude` has open: `(session index, process index,
+/// matched by id)`. `sessions` is newest first; `last` is each one's last write.
+///
+/// A process is on the session it wrote to most recently. Per directory, the `n`
+/// processes there own the `n` sessions written to most recently since the oldest
+/// of them started. A `--resume` id counts only while that session is one of those
+/// (or nothing was written since the process started, i.e. it was just resumed).
+fn assign(
+    sessions: &[(String, String, Option<chrono::DateTime<chrono::Utc>>)],
+    procs: &[Running],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<(usize, usize, bool)> {
+    let started = |p: &Running| now - chrono::Duration::seconds(p.age + 5);
+    let mut out: Vec<(usize, usize, bool)> = Vec::new();
+    let mut taken: HashSet<usize> = HashSet::new();
+    let mut done: HashSet<usize> = HashSet::new();
+    let by_id = |id: &str| sessions.iter().position(|(sid, _, _)| sid == id);
+
+    let mut dirs: Vec<&str> = procs.iter().filter_map(|p| p.dir.as_deref()).collect();
+    dirs.sort();
+    dirs.dedup();
+    for dir in dirs {
+        let mut here: Vec<usize> = (0..procs.len())
+            .filter(|&k| procs[k].dir.as_deref() == Some(dir))
+            .collect();
+        let Some(earliest) = here.iter().map(|&k| started(&procs[k])).min() else {
+            continue;
+        };
+        // The sessions being written to here right now.
+        let current: Vec<usize> = sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, d, last))| d == dir && last.is_some_and(|t| t >= earliest))
+            .map(|(i, _)| i)
+            .take(here.len())
+            .collect();
+        // 1. A --resume id that is still being written to.
+        for &k in &here {
+            if let Some(i) = procs[k].resumed.as_deref().and_then(by_id)
+                && current.contains(&i)
+                && taken.insert(i)
+            {
+                out.push((i, k, true));
+                done.insert(k);
+            }
+        }
+        // 2. The rest, youngest first: the newest session written since it started.
+        here.retain(|k| !done.contains(k));
+        here.sort_by_key(|&k| procs[k].age);
+        for &k in &here {
+            let since = started(&procs[k]);
+            if let Some(&i) = current
+                .iter()
+                .find(|&&i| !taken.contains(&i) && sessions[i].2.is_some_and(|t| t >= since))
+            {
+                taken.insert(i);
+                out.push((i, k, false));
+                done.insert(k);
+            }
+        }
+    }
+    // 3. Just resumed and nothing typed yet: nothing written since it started, so
+    //    trust the id (also for processes whose directory couldn't be read).
+    for (k, p) in procs.iter().enumerate() {
+        if done.contains(&k) {
+            continue;
+        }
+        if let Some(i) = p.resumed.as_deref().and_then(by_id)
+            && sessions[i].2.is_none_or(|t| t < started(p))
+            && taken.insert(i)
+        {
+            out.push((i, k, true));
+        }
+    }
+    out
+}
+
+/// Mark the sessions that are open in a running `claude` (clearing old marks).
+/// Cheap enough to run often: one `ps`, and `/proc` or one `lsof`.
 pub fn annotate(sessions: &mut [SessionRow]) {
+    for s in sessions.iter_mut() {
+        s.live = None;
+    }
     if !cfg!(unix) || crate::config::env("NO_LIVE").is_some() {
         return;
     }
@@ -186,49 +278,37 @@ pub fn annotate(sessions: &mut [SessionRow]) {
     if procs.is_empty() {
         return;
     }
-    let mut taken: HashSet<usize> = HashSet::new();
-    let mut guess = Vec::new();
-    for p in &procs {
-        match resumed_id(&p.args).and_then(|id| sessions.iter().position(|s| s.id == id)) {
-            Some(i) => {
-                taken.insert(i);
-                sessions[i].live = Some(Live {
-                    pid: p.pid,
-                    tty: p.tty.clone(),
-                    exact: true,
-                });
-            }
-            None => guess.push(p),
-        }
-    }
-    let dirs = cwds(&guess.iter().map(|p| p.pid).collect::<Vec<_>>());
-    let now = chrono::Utc::now();
-    // Youngest process first, so each one gets the newest transcript it could own.
-    guess.sort_by_key(|p| p.age);
-    for p in guess {
-        let Some(dir) = dirs.get(&p.pid).map(|d| crate::text::norm_path(d)) else {
-            continue;
-        };
-        let started = now - chrono::Duration::seconds(p.age + 5);
-        // `sessions` is newest first: the first unclaimed one in this directory that
-        // was written to after the process started.
-        let hit = sessions.iter().enumerate().position(|(i, s)| {
-            !taken.contains(&i)
-                && !s.missing
-                && crate::text::norm_path(&s.resume_dir()) == dir
-                && s.ended
-                    .as_deref()
-                    .and_then(crate::text::parse_ts)
-                    .is_some_and(|t| t >= started)
+    let dirs = cwds(&procs.iter().map(|p| p.pid).collect::<Vec<_>>());
+    let running: Vec<Running> = procs
+        .iter()
+        .map(|p| Running {
+            pid: p.pid,
+            tty: p.tty.clone(),
+            age: p.age,
+            resumed: resumed_id(&p.args),
+            dir: dirs.get(&p.pid).map(|d| crate::text::norm_path(d)),
+        })
+        .collect();
+    let view: Vec<(String, String, Option<chrono::DateTime<chrono::Utc>>)> = sessions
+        .iter()
+        .map(|s| {
+            (
+                s.id.clone(),
+                if s.missing {
+                    String::new()
+                } else {
+                    crate::text::norm_path(&s.resume_dir())
+                },
+                s.ended.as_deref().and_then(crate::text::parse_ts),
+            )
+        })
+        .collect();
+    for (i, k, exact) in assign(&view, &running, chrono::Utc::now()) {
+        sessions[i].live = Some(Live {
+            pid: running[k].pid,
+            tty: running[k].tty.clone(),
+            exact,
         });
-        if let Some(i) = hit {
-            taken.insert(i);
-            sessions[i].live = Some(Live {
-                pid: p.pid,
-                tty: p.tty.clone(),
-                exact: false,
-            });
-        }
     }
 }
 
@@ -365,6 +445,75 @@ mod tests {
         assert!(!is_claude(&v("ccrumbs")));
         assert!(!is_claude(&v("vim claude.md")));
         assert!(is_claude(&v("claude fix the config loader")));
+    }
+
+    fn at(min: i64) -> Option<chrono::DateTime<chrono::Utc>> {
+        Some(chrono::DateTime::from_timestamp(1_800_000_000 + min * 60, 0).unwrap())
+    }
+
+    fn proc(pid: u32, started_min: i64, resumed: Option<&str>, dir: &str) -> Running {
+        // "now" is minute 100 in these tests.
+        Running {
+            pid,
+            tty: format!("pts/{pid}"),
+            age: (100 - started_min) * 60,
+            resumed: resumed.map(str::to_string),
+            dir: Some(dir.into()),
+        }
+    }
+
+    fn sess(
+        id: &str,
+        dir: &str,
+        last_min: i64,
+    ) -> (String, String, Option<chrono::DateTime<chrono::Utc>>) {
+        (id.into(), dir.into(), at(last_min))
+    }
+
+    fn matched(
+        s: &[(String, String, Option<chrono::DateTime<chrono::Utc>>)],
+        p: &[Running],
+    ) -> Vec<(String, u32)> {
+        let mut v: Vec<(String, u32)> = assign(s, p, at(100).unwrap())
+            .into_iter()
+            .map(|(i, k, _)| (s[i].0.clone(), p[k].pid))
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn a_cleared_session_is_not_open_any_more() {
+        // Started as `claude --resume a`, then /clear: it now writes to b.
+        let s = vec![sess("b", "/w", 99), sess("a", "/w", 60)];
+        let p = vec![proc(1, 50, Some("a"), "/w")];
+        assert_eq!(matched(&s, &p), vec![("b".into(), 1)]);
+    }
+
+    #[test]
+    fn a_session_closed_before_the_process_started_is_not_open() {
+        // a was closed at minute 70; a new claude started at 80 hasn't written yet.
+        let s = vec![sess("a", "/w", 70)];
+        let p = vec![proc(1, 80, None, "/w")];
+        assert!(matched(&s, &p).is_empty());
+    }
+
+    #[test]
+    fn two_processes_in_one_directory() {
+        let s = vec![
+            sess("y", "/w", 99),
+            sess("x", "/w", 98),
+            sess("old", "/w", 10),
+        ];
+        let p = vec![proc(1, 50, Some("x"), "/w"), proc(2, 90, None, "/w")];
+        assert_eq!(matched(&s, &p), vec![("x".into(), 1), ("y".into(), 2)]);
+    }
+
+    #[test]
+    fn just_resumed_and_untouched_counts_as_open() {
+        let s = vec![sess("a", "/w", 10)];
+        let p = vec![proc(1, 95, Some("a"), "/w")];
+        assert_eq!(matched(&s, &p), vec![("a".into(), 1)]);
     }
 
     #[test]
