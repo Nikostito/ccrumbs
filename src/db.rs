@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 /// Bump when the derived tables change shape; they are rebuilt from transcripts.
 /// `ai` and `prs` hold data that can't be re-derived locally and are kept.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// Every column of `sessions` beyond the key, so later versions can add columns to
 /// an existing database with ALTER TABLE instead of rebuilding it.
@@ -44,6 +44,8 @@ const SESSION_COLUMNS: &[(&str, &str)] = &[
     ("compactions", "INT DEFAULT 0"),
     ("cost_usd", "REAL DEFAULT 0"),
     ("tickets_json", "TEXT"),
+    ("todos_json", "TEXT"),
+    ("days_json", "TEXT"),
 ];
 
 pub struct Db {
@@ -85,7 +87,7 @@ impl Db {
                 tokens_in INT, tokens_out INT, model TEXT, entrypoint TEXT, cloud_id TEXT,
                 last_reply TEXT, auto_desc TEXT, mtime INT, size INT, missing INT DEFAULT 0,
                 context_tokens INT DEFAULT 0, compactions INT DEFAULT 0, cost_usd REAL DEFAULT 0,
-                tickets_json TEXT
+                tickets_json TEXT, todos_json TEXT, days_json TEXT
             );
             -- Transcript files that hold no session (e.g. only a summary), so they
             -- aren't parsed again on every run.
@@ -114,6 +116,14 @@ impl Db {
             "#,
         )?;
         self.ensure_columns()?;
+        self.ensure_pr_columns()?;
+        // The parser learned new fields: read every transcript again on the next index
+        // (rows whose transcript is gone keep what they have).
+        if v != 0 && v < 7 {
+            self.conn.execute_batch(
+                "UPDATE sessions SET mtime = -1 WHERE missing = 0; DELETE FROM skipped;",
+            )?;
+        }
         self.conn
             .pragma_update(None, "user_version", v.max(SCHEMA_VERSION))?;
         Ok(())
@@ -147,6 +157,32 @@ impl Db {
              DROP TABLE keep_fts;",
         )?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// PR status columns (added in schema 7).
+    fn ensure_pr_columns(&self) -> Result<()> {
+        let have: std::collections::HashSet<String> = {
+            let mut st = self
+                .conn
+                .prepare("SELECT name FROM pragma_table_info('prs')")?;
+            st.query_map([], |r| r.get(0))?
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        for col in [
+            "review_decision",
+            "checks",
+            "mergeable",
+            "feedback_at",
+            "feedback_by",
+            "status_synced",
+        ] {
+            if !have.contains(col) {
+                self.conn
+                    .execute(&format!("ALTER TABLE prs ADD COLUMN {col} TEXT"), [])?;
+            }
+        }
         Ok(())
     }
 
@@ -232,8 +268,9 @@ impl Db {
                 "INSERT INTO sessions (id, path, project_dir, cwd, branch, repo, started, ended, user_prompts,
                  assistant_msgs, custom_title, summary, first_prompt, last_prompt, prompts_json, files_json,
                  commands_run, tests_ran, commits, tokens_in, tokens_out, model, entrypoint, cloud_id,
-                 last_reply, auto_desc, mtime, size, missing, context_tokens, compactions, cost_usd, tickets_json)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,0,?29,?30,?31,?32)",
+                 last_reply, auto_desc, mtime, size, missing, context_tokens, compactions, cost_usd, tickets_json,
+                 todos_json, days_json)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,0,?29,?30,?31,?32,?33,?34)",
             )?;
             let mut ins_p = tx.prepare(
                 "INSERT OR IGNORE INTO session_prs (session_id, repo, number, role, ts, evidence) VALUES (?1,?2,?3,?4,?5,?6)",
@@ -288,7 +325,9 @@ impl Db {
                     s.context_tokens as i64,
                     s.compactions,
                     s.cost_usd,
-                    serde_json::to_string(&s.tickets)?
+                    serde_json::to_string(&s.tickets)?,
+                    serde_json::to_string(&s.todos)?,
+                    serde_json::to_string(&s.days)?
                 ])?;
                 tm[1] += t.elapsed();
                 let t = std::time::Instant::now();
@@ -391,7 +430,7 @@ impl Db {
                     s.custom_title, s.summary, s.first_prompt, s.last_prompt, s.files_json, s.tests_ran, s.commits,
                     s.tokens_in, s.tokens_out, s.model, s.entrypoint, s.cloud_id, s.auto_desc, a.title, a.description, s.missing,
                     s.context_tokens, s.compactions, s.cost_usd, s.tickets_json,
-                    m.pinned, m.hidden, m.note
+                    m.pinned, m.hidden, m.note, s.last_reply, s.todos_json, s.days_json
              FROM sessions s LEFT JOIN ai a ON a.id = s.id LEFT JOIN marks m ON m.id = s.id
              ORDER BY COALESCE(s.ended, s.started) DESC",
         )?;
@@ -433,6 +472,11 @@ impl Db {
                 pinned: r.get::<_, Option<bool>>(29)?.unwrap_or(false),
                 hidden: r.get::<_, Option<bool>>(30)?.unwrap_or(false),
                 note: r.get(31)?,
+                last_reply: r.get(32)?,
+                todos: json_col(r.get(33)?),
+                days: json_col(r.get(34)?),
+                live: None,
+                needs: vec![],
             }
             .with_ticket_candidates(r.get::<_, Option<String>>(28)?))
         })?;
@@ -456,7 +500,9 @@ impl Db {
             s.prs = links.remove(&s.id).unwrap_or_default();
             s.tickets = crate::tickets::resolve(c, &trusted, any_prefix);
         }
-        Ok(out.into_iter().map(|(s, _)| s).collect())
+        let mut sessions: Vec<SessionRow> = out.into_iter().map(|(s, _)| s).collect();
+        crate::needs::annotate(&mut sessions, &self.load_prs()?);
+        Ok(sessions)
     }
 
     fn mark(&self, id: &str, col: &str, val: &dyn rusqlite::ToSql) -> Result<()> {
@@ -529,19 +575,33 @@ impl Db {
         Ok(())
     }
 
+    /// Store PR metadata. Status columns are only written when `p.status` is set, so a
+    /// plain `ccrumbs sync` doesn't wipe what the status refresh found.
     pub fn upsert_pr(&self, p: &PrMeta) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO prs (repo, number, title, state, author, url, head, created_at, body_session, claude_footer, synced)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            "INSERT INTO prs (repo, number, title, state, author, url, head, created_at, body_session, claude_footer, synced)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+             ON CONFLICT (repo, number) DO UPDATE SET title=excluded.title, state=excluded.state,
+               author=excluded.author, url=excluded.url, head=excluded.head, created_at=excluded.created_at,
+               body_session=excluded.body_session, claude_footer=excluded.claude_footer, synced=excluded.synced",
             params![p.repo, p.number, p.title, p.state, p.author, p.url, p.head, p.created_at, p.body_session,
                     p.claude_footer, chrono::Utc::now().to_rfc3339()],
         )?;
+        if let Some(st) = &p.status {
+            self.conn.execute(
+                "UPDATE prs SET review_decision=?3, checks=?4, mergeable=?5, feedback_at=?6, feedback_by=?7,
+                 status_synced=?8 WHERE repo=?1 AND number=?2",
+                params![p.repo, p.number, st.review_decision, st.checks, st.mergeable, st.feedback_at,
+                        st.feedback_by, st.synced],
+            )?;
+        }
         Ok(())
     }
 
     pub fn load_prs(&self) -> Result<Vec<PrMeta>> {
         let mut st = self.conn.prepare(
-            "SELECT repo, number, title, state, author, url, head, created_at, body_session, claude_footer FROM prs",
+            "SELECT repo, number, title, state, author, url, head, created_at, body_session, claude_footer,
+                    review_decision, checks, mergeable, feedback_at, feedback_by, status_synced FROM prs",
         )?;
         let rows = st.query_map([], |r| {
             Ok(PrMeta {
@@ -555,6 +615,19 @@ impl Db {
                 created_at: r.get(7)?,
                 body_session: r.get(8)?,
                 claude_footer: r.get::<_, Option<bool>>(9)?.unwrap_or(false),
+                status: r
+                    .get::<_, Option<String>>(15)?
+                    .map(|synced| -> rusqlite::Result<_> {
+                        Ok(crate::model::PrStatus {
+                            review_decision: r.get::<_, Option<String>>(10)?.unwrap_or_default(),
+                            checks: r.get::<_, Option<String>>(11)?.unwrap_or_default(),
+                            mergeable: r.get::<_, Option<String>>(12)?.unwrap_or_default(),
+                            feedback_at: r.get(13)?,
+                            feedback_by: r.get(14)?,
+                            synced,
+                        })
+                    })
+                    .transpose()?,
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
@@ -568,6 +641,11 @@ impl Db {
         let rows = st.query_map([], |r| r.get(0))?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
+}
+
+fn json_col<T: serde::de::DeserializeOwned + Default>(j: Option<String>) -> T {
+    j.and_then(|j| serde_json::from_str(&j).ok())
+        .unwrap_or_default()
 }
 
 /// Turn free text into a safe FTS5 query: every word must appear (prefix match on the last).

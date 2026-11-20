@@ -215,6 +215,18 @@ impl Ctx {
                             ));
                         }
                     }
+                    if !s.todos.is_empty() {
+                        out.push_str("\nClaude's to-do list when the session ended:\n");
+                        for t in &s.todos {
+                            out.push_str(&format!("[{}] {}\n", t.status, t.text));
+                        }
+                    }
+                    if !s.needs.is_empty() {
+                        out.push_str(&format!(
+                            "\nIts PR needs attention: {}\n",
+                            s.needs.join("; ")
+                        ));
+                    }
                     if !s.files_edited.is_empty() {
                         out.push_str(&format!("\nFiles edited: {}\n", s.files_edited.join(", ")));
                     }

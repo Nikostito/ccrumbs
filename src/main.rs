@@ -8,8 +8,10 @@ mod describe;
 mod github;
 mod index;
 mod launch;
+mod live;
 mod mcp;
 mod model;
+mod needs;
 mod parse;
 mod prdetect;
 mod prview;
@@ -20,8 +22,9 @@ mod theme;
 mod tickets;
 mod transcript;
 mod tui;
+mod worklog;
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use clap::{Parser, Subcommand};
 use config::Config;
 use db::Db;
@@ -64,6 +67,9 @@ enum Cmd {
         /// Print the resume command instead of running it.
         #[arg(long)]
         print: bool,
+        /// Open it even if it's already open in another terminal.
+        #[arg(long)]
+        again: bool,
     },
     /// List recent sessions with descriptions. Takes the same filters as the picker.
     List {
@@ -138,6 +144,36 @@ enum Cmd {
         tab: bool,
         #[arg(long)]
         print: bool,
+        /// Open it even if it's already open in another terminal.
+        #[arg(long)]
+        again: bool,
+    },
+    /// Sessions whose PR needs you: failing CI, a merge conflict, new reviews or
+    /// comments, or approved and ready to merge (checks GitHub with `gh`).
+    Needs {
+        /// Use what was fetched last time; don't ask GitHub.
+        #[arg(long)]
+        offline: bool,
+    },
+    /// What you worked on, day by day: `ccrumbs log`, `log --on tuesday`, `log --since 2w`.
+    Log {
+        /// Optional filters, as in the picker: p:project, has:pr, t:ABC-1 ...
+        query: Vec<String>,
+        /// One day: today, yesterday, tuesday, "last friday", 2026-11-17, 3d.
+        #[arg(long, conflicts_with = "since")]
+        on: Option<String>,
+        /// First day: a day as for --on, or week, month, 2w. Default: week.
+        #[arg(long)]
+        since: Option<String>,
+        /// Only sessions started on those days, not ones continued from before.
+        #[arg(long)]
+        created: bool,
+        /// Markdown, to paste into a stand-up note or timesheet.
+        #[arg(long)]
+        md: bool,
+        /// Include quick one-question sessions.
+        #[arg(long)]
+        all: bool,
     },
     /// Export a session (summary, PRs, files, conversation) as Markdown.
     Export {
@@ -450,14 +486,28 @@ fn real_main() -> Result<()> {
             Ok(())
         }
         Cmd::ShellInit { .. } | Cmd::Mcp | Cmd::Completions { .. } => unreachable!(),
-        Cmd::Go { query, print } => go(&mut db, &cfg, &query.join(" "), print),
+        Cmd::Go {
+            query,
+            print,
+            again,
+        } => go(&mut db, &cfg, &query.join(" "), print, again),
+        Cmd::Needs { offline } => needs_cmd(&p, &db, offline),
+        Cmd::Log {
+            query,
+            on,
+            since,
+            created,
+            md,
+            all,
+        } => log_cmd(&p, &db, &query.join(" "), on, since, created, md, all),
         Cmd::List {
             query,
             limit,
             project,
             short,
         } => {
-            let sessions = db.load_sessions()?;
+            let mut sessions = db.load_sessions()?;
+            live::annotate(&mut sessions);
             let mut q = search::parse(&query.join(" "));
             q.project.extend(project.map(|p| p.to_lowercase()));
             let prs = prview::build(&sessions, &db.load_prs()?);
@@ -501,7 +551,8 @@ fn real_main() -> Result<()> {
             Ok(())
         }
         Cmd::Show { id } => {
-            let sessions = db.load_sessions()?;
+            let mut sessions = db.load_sessions()?;
+            live::annotate(&mut sessions);
             let s = one(&sessions, &id)?;
             let prs = prview::build(&sessions, &db.load_prs()?);
             show(&p, s, &sessions, &prs);
@@ -536,11 +587,20 @@ fn real_main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Resume { id, tab, print } => {
-            let sessions = db.load_sessions()?;
+        Cmd::Resume {
+            id,
+            tab,
+            print,
+            again,
+        } => {
+            let mut sessions = db.load_sessions()?;
+            live::annotate(&mut sessions);
             let s = one(&sessions, &id)?;
             if print {
                 println!("{}", launch::resume_command(s));
+                Ok(())
+            } else if !again && let Some(msg) = launch::already_open(s)? {
+                eprintln!("{msg}");
                 Ok(())
             } else if tab {
                 println!("{}", launch::open_tab(s)?);
@@ -613,6 +673,10 @@ fn config_cmd(cmd: Cmd, cfg: &mut Config) -> Result<()> {
             println!("transcripts      {}", cfg.projects_dir().display());
             println!("describe model   {}", cfg.describe_model);
             println!("ignored projects {:?}", cfg.ignored_projects);
+            println!(
+                "refresh_prs      {} (check open PRs' CI and reviews when the picker opens)",
+                cfg.refresh_prs
+            );
         }
     }
     Ok(())
@@ -644,6 +708,10 @@ fn pick_mode(db: &mut Db, cfg: &Config, query: &str, mode: PickMode) -> Result<(
         }
         (tui::Outcome::Resume(s), PickMode::Dir) => {
             println!("{}", s.resume_dir());
+            Ok(())
+        }
+        (tui::Outcome::Switched(msg), _) => {
+            eprintln!("{msg}");
             Ok(())
         }
         (tui::Outcome::Quit, _) => Ok(()),
@@ -881,11 +949,17 @@ fn open_cmd(db: &Db, target: &str, pr: bool, ticket: bool, cloud: bool, print: b
     Ok(())
 }
 
-fn go(db: &mut Db, cfg: &Config, query: &str, print: bool) -> Result<()> {
-    let sessions = db.load_sessions()?;
+fn go(db: &mut Db, cfg: &Config, query: &str, print: bool, again: bool) -> Result<()> {
+    let mut sessions = db.load_sessions()?;
+    if !print {
+        live::annotate(&mut sessions);
+    }
     let run = |s: &SessionRow| -> Result<()> {
         if print {
             println!("{}", launch::resume_command(s));
+            Ok(())
+        } else if !again && let Some(msg) = launch::already_open(s)? {
+            eprintln!("{msg}");
             Ok(())
         } else {
             launch::resume_here(s)
@@ -1031,11 +1105,17 @@ fn print_row(p: &Paint, s: &SessionRow, long: bool) {
         (false, true) => p.c("33", "≡ "),
         _ => String::new(),
     };
-    let tickets: String = s
+    let mut tickets: String = s
         .tickets
         .iter()
         .map(|t| format!(" {}", p.c("36", t)))
         .collect();
+    if s.live.is_some() {
+        tickets.push_str(&format!(" {}", p.c("32", "● open")));
+    }
+    if !s.needs.is_empty() {
+        tickets.push_str(&format!(" {}", p.c("31", "! needs you")));
+    }
     println!(
         "{}  {:>4}  {}  {:<18}  {mark}{}{}{tickets}",
         p.c("34", s.short_id()),
@@ -1063,6 +1143,209 @@ fn actor(p: &Paint, sessions: &[SessionRow], a: &Actor) -> String {
     }
 }
 
+/// "Where you left off": Claude's open to-dos and the start of its last reply.
+fn left_off(p: &Paint, s: &SessionRow) {
+    let open = s.open_todos();
+    let reply = s.reply_excerpt(3);
+    if open.is_empty() && reply.is_empty() {
+        return;
+    }
+    println!();
+    println!("{}", p.c("1;36", "Where you left off"));
+    if !open.is_empty() {
+        println!(
+            "  {}",
+            p.dim(format!("{} of {} to-dos open", open.len(), s.todos.len()))
+        );
+        for t in open.iter().take(8) {
+            if t.status == "in_progress" {
+                println!("  {} {}", p.c("33", "►"), t.text);
+            } else {
+                println!("  {} {}", p.dim("○"), t.text);
+            }
+        }
+        if open.len() > 8 {
+            println!("  {}", p.dim(format!("+{} more", open.len() - 8)));
+        }
+    }
+    if !reply.is_empty() {
+        println!("  {}", p.dim("Claude's last reply:"));
+        for l in reply {
+            println!("  {}", p.dim(truncate(&l, 110)));
+        }
+    }
+}
+
+/// `ccrumbs needs`: refresh PR status (unless offline) and list what needs you.
+fn needs_cmd(p: &Paint, db: &Db, offline: bool) -> Result<()> {
+    let mut sessions = db.load_sessions()?;
+    if !offline {
+        if !github::available() {
+            bail!(
+                "`gh` (the GitHub CLI) is needed to check your PRs; --offline shows what was fetched last time"
+            );
+        }
+        let stale = needs::stale(&sessions, &db.load_prs()?, chrono::Duration::zero());
+        if !stale.is_empty() {
+            eprintln!(
+                "{}",
+                p.dim(format!(
+                    "Checking {} open PR{}…",
+                    stale.len(),
+                    if stale.len() == 1 { "" } else { "s" }
+                ))
+            );
+            let (_, err) = needs::refresh(db, &stale);
+            if let Some(e) = err {
+                eprintln!(
+                    "{}",
+                    p.c("33", format!("some PRs could not be checked: {e}"))
+                );
+            }
+            sessions = db.load_sessions()?;
+        }
+    }
+    live::annotate(&mut sessions);
+    let hits: Vec<&SessionRow> = sessions
+        .iter()
+        .filter(|s| !s.needs.is_empty() && !s.hidden)
+        .collect();
+    if hits.is_empty() {
+        println!(
+            "Nothing needs you: no open PR from your sessions has failing CI, conflicts, new feedback or an approval."
+        );
+        return Ok(());
+    }
+    for s in hits {
+        println!(
+            "{}  {:>4}  {:<18}  {}{}",
+            p.c("34", s.short_id()),
+            age(s.ended.as_deref().or(s.started.as_deref())),
+            truncate(&s.project_name(), 18),
+            p.bold(truncate(&s.title(), 72)),
+            if s.live.is_some() {
+                format!("  {}", p.c("32", "● open"))
+            } else {
+                String::new()
+            }
+        );
+        for n in &s.needs {
+            println!("                {}", p.c("31", format!("! {n}")));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn log_cmd(
+    p: &Paint,
+    db: &Db,
+    query: &str,
+    on: Option<String>,
+    since: Option<String>,
+    created: bool,
+    md: bool,
+    all: bool,
+) -> Result<()> {
+    let sessions = db.load_sessions()?;
+    let today = chrono::Local::now().date_naive();
+    let (from, to) = match (&on, &since) {
+        (Some(d), _) => {
+            let d = worklog::parse_day(d, today).with_context(|| {
+                format!("can't read the day {d:?}; try today, yesterday, tuesday, \"last friday\", 2026-11-17 or 3d")
+            })?;
+            (d, d)
+        }
+        (None, Some(s)) => (
+            worklog::parse_since(s, today).with_context(|| {
+                format!("can't read {s:?}; try week, month, 2w, tuesday or 2026-11-01")
+            })?,
+            today,
+        ),
+        (None, None) => (worklog::parse_since("week", today).unwrap_or(today), today),
+    };
+    let q = search::parse(query);
+    let keep = |s: &SessionRow| search::passes(s, None, &q) && (all || !search::is_quick(s));
+    let days = worklog::build(&sessions, from, to, created, keep);
+    if days.is_empty() {
+        let span = if from == to {
+            from.format("%a %d %b").to_string()
+        } else {
+            format!("{} – {}", from.format("%a %d %b"), to.format("%a %d %b"))
+        };
+        println!("No sessions on {span}.");
+        return Ok(());
+    }
+    for (n, d) in days.iter().enumerate() {
+        if n > 0 {
+            println!();
+        }
+        let title = d.date.format("%A %d %B").to_string();
+        if md {
+            println!("## {title}");
+        } else {
+            println!(
+                "{}  {}",
+                p.bold(&title),
+                p.dim(worklog::day_summary(&sessions, d))
+            );
+        }
+        for (label, list) in [("", &d.new), ("continued", &d.continued)] {
+            if list.is_empty() {
+                continue;
+            }
+            if !label.is_empty() && !d.new.is_empty() {
+                if md {
+                    println!("\n*Continued from earlier:*");
+                } else {
+                    println!("  {}", p.dim("continued from earlier"));
+                }
+            }
+            for &i in list.iter() {
+                log_line(p, &sessions[i], md, label.is_empty());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn log_line(p: &Paint, s: &SessionRow, md: bool, new: bool) {
+    let work: Vec<String> = worklog::pr_work(s)
+        .into_iter()
+        .map(|(r, pr)| format!("{} {pr}", r.as_str()))
+        .chain(s.tickets.iter().cloned())
+        .collect();
+    if md {
+        let mut l = format!("- **{}** ({})", s.title(), s.project_name());
+        if !work.is_empty() {
+            l.push_str(&format!(" — {}", work.join(", ")));
+        }
+        println!("{l}");
+        return;
+    }
+    let when = if new {
+        s.started
+            .as_deref()
+            .and_then(text::parse_ts)
+            .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
+            .unwrap_or_default()
+    } else {
+        "  ·  ".to_string()
+    };
+    let title = truncate(&s.title(), 64);
+    let pad = " ".repeat(64usize.saturating_sub(text::width(&title)));
+    let work = if work.is_empty() {
+        String::new()
+    } else {
+        format!("{pad}  {}", p.c("36", work.join(" · ")))
+    };
+    println!(
+        "  {}  {:<16}  {title}{work}",
+        p.dim(format!("{when:>5}")),
+        truncate(&s.project_name(), 16),
+    );
+}
+
 fn show(p: &Paint, s: &SessionRow, sessions: &[SessionRow], prs: &[PrEntry]) {
     println!("{}", p.bold(s.title()));
     println!(
@@ -1076,6 +1359,12 @@ fn show(p: &Paint, s: &SessionRow, sessions: &[SessionRow], prs: &[PrEntry]) {
         )
     );
     println!("{}", home_short(&s.resume_dir()));
+    if let Some(l) = &s.live {
+        println!(
+            "{}",
+            p.c("32", format!("● open now in another terminal ({})", l.tty))
+        );
+    }
     let mut meta = format!(
         "{} · {} prompt{}",
         local_time(s.started.as_deref()),
@@ -1148,6 +1437,14 @@ fn show(p: &Paint, s: &SessionRow, sessions: &[SessionRow], prs: &[PrEntry]) {
     for l in s.description().lines() {
         println!("  {l}");
     }
+    if !s.needs.is_empty() {
+        println!();
+        println!("{}", p.c("1;31", "Needs you"));
+        for n in &s.needs {
+            println!("  {}", p.c("31", n));
+        }
+    }
+    left_off(p, s);
     let me = sessions.iter().position(|x| x.id == s.id);
     let linked = s.pr_summary();
     if !linked.is_empty() {

@@ -20,6 +20,7 @@ const KEEP_PROMPTS: usize = 12;
 static TEST_CMD: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\b(cargo (test|nextest)|pytest|npm (run )?test|yarn test|pnpm (run )?test|go test|jest|vitest|make (test|check)|rspec|mvn test|gradle\w* test|tox|phpunit|dotnet test|bun test|playwright test)\b").unwrap()
 });
+static TASK_ID: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"Task #(\w+)").unwrap());
 static GIT_COMMIT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bgit\s+commit\b").unwrap());
 
 #[derive(Default)]
@@ -38,6 +39,13 @@ struct State {
     /// message; count boundaries, and summaries only for older files without them.
     boundaries: u32,
     summaries: u32,
+    /// Claude's to-do list: (task id, item). TodoWrite replaces it, TaskCreate adds,
+    /// TaskUpdate changes one item.
+    todos: Vec<(String, crate::model::Todo)>,
+    /// TaskCreate calls waiting for their result, which carries the new task's id.
+    task_creates: HashMap<String, String>,
+    days: std::collections::BTreeSet<String>,
+    day_minute: String,
 }
 
 /// Session ids are file names; they end up in shell commands, so only accept the
@@ -111,6 +119,21 @@ pub fn parse_session(
         .max_by_key(|(_, c)| **c)
         .map(|(k, _)| k.clone());
     st.s.files_edited = st.files;
+    // TaskCreate calls whose result never arrived still count.
+    let mut orphans: Vec<(String, String)> = st.task_creates.drain().collect();
+    orphans.sort();
+    for (_, text) in orphans {
+        let id = format!("?{}", st.todos.len() + 1);
+        st.todos.push((
+            id,
+            crate::model::Todo {
+                text,
+                status: "pending".into(),
+            },
+        ));
+    }
+    st.s.todos = st.todos.into_iter().map(|(_, t)| t).collect();
+    st.s.days = st.days.into_iter().collect();
     st.s.pr_links = dedupe(st.links);
     if st.s.user_prompts == 0 && st.s.assistant_msgs == 0 && st.s.custom_title.is_none() {
         return None;
@@ -166,6 +189,17 @@ fn handle(v: &Value, st: &mut State, sidechain_file: bool) {
             st.s.ended = Some(t.clone());
         }
         st.cur_ts = Some(t.clone());
+        // Local day of each record; converting is the slow part, so do it once a minute.
+        if !sidechain_file && t.get(..16) != Some(st.day_minute.as_str()) {
+            st.day_minute = t.get(..16).unwrap_or("").to_string();
+            if let Some(d) = text::parse_ts(t) {
+                st.days.insert(
+                    d.with_timezone(&chrono::Local)
+                        .format("%Y-%m-%d")
+                        .to_string(),
+                );
+            }
+        }
     }
     if !sidechain_file {
         if st.s.cwd.is_none() {
@@ -292,6 +326,24 @@ fn handle_tool_result(b: &Value, st: &mut State) {
     let Some(id) = str_of(b, "tool_use_id") else {
         return;
     };
+    if let Some(text) = st.task_creates.remove(id) {
+        let out = result_text(b);
+        let tid = TASK_ID
+            .captures(&out)
+            .map(|c| c[1].to_string())
+            .unwrap_or_else(|| format!("?{}", st.todos.len() + 1));
+        let is_error = b.get("is_error").and_then(|x| x.as_bool()).unwrap_or(false);
+        if !is_error {
+            st.todos.push((
+                tid,
+                crate::model::Todo {
+                    text,
+                    status: "pending".into(),
+                },
+            ));
+        }
+        return;
+    }
     let Some(ps) = st.pending.remove(id) else {
         return;
     };
@@ -367,16 +419,19 @@ fn handle_assistant(v: &Value, st: &mut State) {
                     }
                 }
             }
-            Some("tool_use") => handle_tool_use(b, st),
+            Some("tool_use") => handle_tool_use(b, st, side),
             _ => {}
         }
     }
 }
 
-fn handle_tool_use(b: &Value, st: &mut State) {
+fn handle_tool_use(b: &Value, st: &mut State, side: bool) {
     let name = str_of(b, "name").unwrap_or("");
     let id = str_of(b, "id").unwrap_or("").to_string();
     let input = b.get("input").cloned().unwrap_or(Value::Null);
+    if !side {
+        track_todos(name, &id, &input, st);
+    }
     // `mcp__github__create_pull_request` -> `create_pull_request`
     let base = name.rsplit("__").next().unwrap_or(name);
 
@@ -438,6 +493,64 @@ fn handle_tool_use(b: &Value, st: &mut State) {
     }
     if !pend.is_empty() {
         st.pending.entry(id).or_default().extend(pend);
+    }
+}
+
+/// Follow Claude's to-do list through TodoWrite (the whole list each time) and
+/// TaskCreate/TaskUpdate (one item at a time).
+fn track_todos(name: &str, call_id: &str, input: &Value, st: &mut State) {
+    let clean = |t: &str| text::cap_bytes(&text::one_line(t), 300).to_string();
+    match name {
+        "TodoWrite" => {
+            let Some(Value::Array(items)) = input.get("todos") else {
+                return;
+            };
+            st.todos = items
+                .iter()
+                .enumerate()
+                .filter_map(|(i, t)| {
+                    let text = str_of(t, "content").or_else(|| str_of(t, "subject"))?;
+                    let status = str_of(t, "status").unwrap_or("pending").to_string();
+                    let id = str_of(t, "id").map(str::to_string).unwrap_or(i.to_string());
+                    Some((
+                        id,
+                        crate::model::Todo {
+                            text: clean(text),
+                            status,
+                        },
+                    ))
+                })
+                .collect();
+        }
+        "TaskCreate" => {
+            if let Some(t) = str_of(input, "subject").or_else(|| str_of(input, "content")) {
+                st.task_creates.insert(call_id.to_string(), clean(t));
+            }
+        }
+        "TaskUpdate" => {
+            let Some(tid) = input.get("taskId").and_then(|v| match v {
+                Value::String(s) => Some(s.clone()),
+                Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            }) else {
+                return;
+            };
+            let Some(pos) = st.todos.iter().position(|(id, _)| *id == tid) else {
+                return;
+            };
+            match str_of(input, "status") {
+                Some("deleted") => {
+                    st.todos.remove(pos);
+                    return;
+                }
+                Some(s) => st.todos[pos].1.status = s.to_string(),
+                None => {}
+            }
+            if let Some(t) = str_of(input, "subject") {
+                st.todos[pos].1.text = clean(t);
+            }
+        }
+        _ => {}
     }
 }
 

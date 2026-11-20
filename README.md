@@ -16,6 +16,14 @@ files. ccrumbs indexes them locally and gives you:
 - **A description of every session**: what you asked, what followed, files
   edited, tests run, commits and PRs. Optionally, Claude writes a short title
   and summary.
+- **Where you left off**: Claude's unfinished to-dos and the start of its
+  last reply, so you know what was next before you resume.
+- **What needs you**: sessions whose PR has since got failing CI, a merge
+  conflict, a new review or comment, or an approval, at the top of the list.
+- **Already open?** Sessions running in another terminal are marked, and
+  **Enter** switches to that terminal instead of starting a second copy.
+- **A work log** for stand-ups and timesheets: `ccrumbs log`, or one day
+  with `ccrumbs log --on tuesday`.
 - **Which PRs came from Claude sessions, and who did what**, e.g. *"Created by
   session A · reviewed by a DIFFERENT session: B"*.
 - **Tasks**: sessions that worked on the same branch, PR or ticket, grouped
@@ -65,12 +73,17 @@ yet. After that, every launch only re-reads sessions that changed.
 
 ## The picker
 
-The left side is a short list grouped as **Pinned**, **Here** (the repo and
-branch you started in), **Today**, **Yesterday**, **This week** and older.
-The right side is a card for the selected session:
+The left side is a short list grouped as **Pinned**, **Needs you** (its PR
+has news, see [below](#what-needs-you)), **Open now** (running in another
+terminal), **Here** (the repo and branch you started in), **Today**,
+**Yesterday**, **This week** and older. The right side is a card for the
+selected session:
 
 - **Facts:** project, branch, prompts, a context bar, cost and model.
+- **Needs you:** failing CI, a conflict, new feedback or an approval on its PR.
 - **What happened**, and a **Next** hint when its context is nearly full.
+- **Where you left off:** Claude's open to-dos (the one in progress first)
+  and the start of its last reply.
 - **Pull requests:** its PRs and who created and reviewed them.
 - **Same task:** other sessions in the same task.
 - **Files edited.**
@@ -90,7 +103,7 @@ Press `?` (with an empty search) for every key and filter:
 | Key | Action |
 |---|---|
 | typing | search titles, projects, branches, PR numbers, tickets, descriptions and prompts |
-| **Enter** | resume the session (in Tasks / PRs: list that task's or PR's sessions) |
+| **Enter** | resume the session, or switch to it if it's already open (in Tasks / PRs: list that task's or PR's sessions) |
 | **Tab** / **Shift-Tab** | Sessions → Tasks → PRs |
 | `^v` | read the whole conversation (`/` find, `n`/`N` next/previous, `o` tool output, Enter to resume) |
 | `^b` / `^k` | open the PR / the Jira or Linear ticket in your browser |
@@ -127,6 +140,8 @@ Filters can be combined with each other and with plain words, in the picker,
 | `@today` `@yesterday` `@week` `@month` `@3d` `@2w` `@12h` | last active in that window |
 | `has:pr` · `has:note` · `is:pinned` · `is:hidden` | sessions with PR work · a note · pinned · hidden |
 | `ctx:>80` · `ctx:<30` | how full the context window was at the end |
+| `is:open` · `is:needs` | open right now in another terminal · its PR needs you |
+| `on:tuesday` `on:yesterday` `on:2026-11-17` `on:last-friday` | active on that day |
 
 ![Filtering by an edited file](https://raw.githubusercontent.com/nikostito/ccrumbs/main/docs/filters.png)
 
@@ -139,6 +154,8 @@ Filters can be combined with each other and with plain words, in the picker,
 | `ccrumbs go <words \| id \| #PR \| filters>` | jump straight in when exactly one session matches; otherwise open the picker with that query |
 | `ccrumbs list [query] [-n 50] [-s]` | recent sessions with descriptions, e.g. `ccrumbs list f:auth @week` |
 | `ccrumbs search <words>` | full-text search |
+| `ccrumbs needs [--offline]` | sessions whose PR needs you (checks GitHub with `gh`) |
+| `ccrumbs log [--on <day> \| --since <day>] [--created] [--md] [filters]` | what you worked on, day by day |
 | `ccrumbs show <id>` | everything about one session |
 | `ccrumbs pr 42` | which sessions created, reviewed or merged PR 42 |
 | `ccrumbs prs [--claude] [--repo web]` | PRs your sessions worked on; `--claude` keeps the ones born from a Claude session |
@@ -146,7 +163,7 @@ Filters can be combined with each other and with plain words, in the picker,
 | `ccrumbs view <id> [--outputs]` | print the conversation |
 | `ccrumbs export <id> [-o file.md \| -o -] [--force]` | the session as Markdown: summary, PRs, tickets, files, conversation |
 | `ccrumbs open <id \| #PR \| ABC-123> [--pr\|--ticket\|--cloud] [--print]` | open the session's PR, ticket or claude.ai page |
-| `ccrumbs resume <id> [--tab \| --print]` | resume here, in a new tab, or print the command |
+| `ccrumbs resume <id> [--tab \| --print] [--again]` | resume here, in a new tab, or print the command; `--again` opens it even if it's already open |
 | `ccrumbs pin` / `unpin` / `hide` / `unhide <id>` | your own marks |
 | `ccrumbs note <id> [text]` | set a note (no text clears it); notes are searchable |
 | `ccrumbs edit <id>` | open the session's project in your editor |
@@ -188,6 +205,60 @@ aliases included), or `git push` output.
 titles and state. It also finds PRs opened from **claude.ai** web sessions:
 those have the session link in their description, even when there's no
 transcript on your machine.
+
+## What needs you
+
+For each open PR that one of your sessions created or worked on in the last
+30 days, ccrumbs asks GitHub (through `gh pr view`) for its review decision,
+checks, mergeability and latest review or comment. The latest session on that
+PR then shows up under **Needs you** when:
+
+- its **CI is failing**;
+- it has a **merge conflict**;
+- a reviewer **requested changes**;
+- someone else **reviewed or commented after the session ended** (your own
+  comments and bot comments don't count; review bots do);
+- it's **approved, green and mergeable**, ready for you to merge.
+
+The picker checks in the background when it opens, at most every 10 minutes
+(`"refresh_prs": false` in the config turns this off). `ccrumbs needs` checks
+right away and lists them; `is:needs` filters to them.
+
+## Already-open sessions
+
+Resuming a session that's still running in another terminal starts a second
+copy writing to the same transcript. ccrumbs finds running `claude`
+processes (a `--resume <id>` names the session; otherwise it's the session in
+that process's directory that it has been writing to) and marks them
+**Open now**. **Enter** or `^o` on one switches to where it runs:
+
+- a **tmux** pane (also across tmux sessions);
+- an **iTerm2** or **Terminal.app** tab (macOS);
+- a **kitty** window or **WezTerm** pane.
+
+Anywhere else, ccrumbs says which terminal it's in; press **Enter** again to
+open a second copy anyway. `ccrumbs resume` and `ccrumbs go` behave the
+same, with `--again` to skip the check.
+
+## Work log
+
+`ccrumbs log` lists what you worked on in the last week, day by day: the
+sessions you started (with the time), the ones you continued from earlier,
+and the PRs and tickets each one touched, with a summary per day.
+
+```bash
+ccrumbs log                       # the last 7 days
+ccrumbs log --on tuesday          # one day: today, yesterday, tuesday, "last friday", 2026-11-17, 3d
+ccrumbs log --on tue --created    # only sessions started that day
+ccrumbs log --since 2w p:api      # two weeks of one project
+ccrumbs log --since monday --md   # Markdown, for a stand-up note or timesheet
+```
+
+![ccrumbs needs and ccrumbs log](https://raw.githubusercontent.com/nikostito/ccrumbs/main/docs/log.png)
+
+A weekday means the latest one, today included. Quick one-question sessions
+are left out unless you add `--all`. In the picker, `on:tuesday` filters to
+the sessions active that day.
 
 ## Tasks
 
@@ -320,7 +391,8 @@ is optional):
   "theme": "dark",
   "editor": "cursor",
   "tickets": { "ABC": "https://yourcompany.atlassian.net/browse/{key}" },
-  "context_windows": {}
+  "context_windows": {},
+  "refresh_prs": true
 }
 ```
 
@@ -332,6 +404,7 @@ is optional):
 | `theme` | `"dark"` (the default; its own gray-black colours, the same in any terminal) or `"terminal"` (your terminal's palette) |
 | `editor` | set when you choose one; any shell command, with the project folder added at the end |
 | `tickets` | ticket prefix → URL with `{key}`; `"*"` applies to every prefix |
+| `refresh_prs` | check your open PRs' CI, reviews and conflicts in the background when the picker opens (needs `gh`; default `true`) |
 | `context_windows` | override the context size used for the context %, by model id fragment, e.g. `{"sonnet-4-5": 1000000}` (built in: 1M for current models, 200k for older ones) |
 
 If the file doesn't parse, ccrumbs says so and won't overwrite it.
@@ -341,6 +414,7 @@ If the file doesn't parse, ccrumbs says so and won't overwrite it.
 | `CCRUMBS_HOME` | where the index and config live (default `~/.ccrumbs`) |
 | `CCRUMBS_EDITOR` | editor to use when none is chosen in the config |
 | `CCRUMBS_TIMING=1` | print how long each indexing phase takes |
+| `CCRUMBS_NO_LIVE=1` | don't look for running `claude` processes |
 | `CLAUDE_CONFIG_DIR` | Claude Code's config folder (transcripts are in its `projects/`) |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL` | for `ccrumbs describe` |
 | `NO_COLOR` | plain output from the command-line commands |
@@ -356,6 +430,9 @@ these features:
   PR numbers, the end of the last reply) to the Anthropic API with your key.
 - **`sync` / `pr --sync`:** calls GitHub through your `gh` login, to read PR
   metadata of repos found in your sessions.
+- **`needs`, and the picker's PR check:** call GitHub through your `gh` login
+  to read the status of open PRs your sessions created or worked on. Turn the
+  picker's check off with `"refresh_prs": false`.
 - **`open`, `^b`, `^k`:** open URLs in your browser.
 - **`mcp`:** answers the Claude Code session it's attached to; that session's
   data handling applies to what Claude reads.
@@ -379,6 +456,9 @@ cores with a warm disk cache:
   by reading the diff in chat counts as *reviewed* if you asked for a review.
 - **claude.ai web sessions can't be resumed locally.** `ccrumbs open <id>
   --cloud` opens them in the browser.
+- **Spotting open sessions works on macOS and Linux**, not Windows. A
+  session started without `--resume` is matched by its directory, after its
+  first message.
 - **Sessions deleted by Claude Code's cleanup** stay searchable (marked
   *transcript deleted*), but can't be resumed or read in full.
 

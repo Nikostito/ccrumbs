@@ -109,17 +109,19 @@ fn grouped_list(
     for r in rows.iter().skip(*offset).take(h) {
         match r {
             Row::Gap => lines.push(Line::raw("")),
-            Row::Head(t, suffix) => lines.push(Line::from(vec![
-                Span::styled(format!("  {}", t.to_uppercase()), head_style()),
-                Span::styled(
-                    if suffix.is_empty() {
-                        String::new()
-                    } else {
-                        format!("  {suffix}")
-                    },
-                    Style::new().fg(th::faint()),
-                ),
-            ])),
+            Row::Head(t, suffix) => {
+                // The subtitle gives way to the column edge.
+                let room = w.saturating_sub(crate::text::width(t) + 6);
+                let suffix = if suffix.is_empty() || room < 8 {
+                    String::new()
+                } else {
+                    format!("  {}", fit(suffix, room))
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {}", t.to_uppercase()), head_style()),
+                    Span::styled(suffix, Style::new().fg(th::faint())),
+                ]))
+            }
             Row::Item(i) => {
                 let sel = selected == Some(*i);
                 let (marker, text, style, right) = item(*i, sel);
@@ -182,6 +184,16 @@ pub(super) fn session_list(f: &mut Frame, app: &mut App, area: Rect) {
             };
             let (g, suffix) = if s.pinned {
                 ("Pinned".to_string(), String::new())
+            } else if !s.needs.is_empty() {
+                (
+                    "Needs you".to_string(),
+                    "its PR has news: CI, conflicts, reviews".to_string(),
+                )
+            } else if s.live.is_some() {
+                (
+                    "Open now".to_string(),
+                    "running in another terminal".to_string(),
+                )
             } else if tier > 0 {
                 (
                     "Here".to_string(),
@@ -236,7 +248,11 @@ pub(super) fn session_list(f: &mut Frame, app: &mut App, area: Rect) {
             let i = shown[k];
             let s = &sessions[i];
             let tier = if here_first { corpus.tier[i] } else { 0 };
-            let marker = if s.pinned {
+            let marker = if !s.needs.is_empty() {
+                Span::styled("!", Style::new().fg(th::red()).add_modifier(Modifier::BOLD))
+            } else if s.live.is_some() {
+                Span::styled("►", Style::new().fg(th::green()))
+            } else if s.pinned {
                 Span::styled("↑", Style::new().fg(th::amber()))
             } else if tier == crate::context::TIER_BRANCH {
                 Span::styled("●", Style::new().fg(th::green()))
@@ -251,7 +267,8 @@ pub(super) fn session_list(f: &mut Frame, app: &mut App, area: Rect) {
                 Style::new().fg(th::fg())
             };
             let ts = s.ended.as_deref().or(s.started.as_deref());
-            let right = if chronological && !s.pinned && tier == 0 {
+            let grouped_apart = s.pinned || !s.needs.is_empty() || s.live.is_some();
+            let right = if chronological && !grouped_apart && tier == 0 {
                 when_label(ts)
             } else {
                 age(ts)
@@ -310,6 +327,54 @@ fn card_area(area: Rect) -> Rect {
     }
 }
 
+/// Claude's open to-dos and the start of its last reply.
+fn left_off(lines: &mut Vec<Line<'static>>, s: &SessionRow, w: usize) {
+    let open = s.open_todos();
+    let reply = s.reply_excerpt(3);
+    if open.is_empty() && reply.is_empty() {
+        return;
+    }
+    let head = if s.todos.is_empty() {
+        "Where you left off".to_string()
+    } else {
+        format!(
+            "Where you left off · {} of {} to-dos open",
+            open.len(),
+            s.todos.len()
+        )
+    };
+    heading(lines, &head);
+    for t in open.iter().take(6) {
+        let (mark, color) = if t.status == "in_progress" {
+            ("► ", th::amber())
+        } else {
+            ("○ ", th::dim())
+        };
+        lines.push(Line::from(vec![
+            Span::styled(mark, Style::new().fg(color)),
+            txt(fit(&t.text, w.saturating_sub(3))),
+        ]));
+    }
+    if open.len() > 6 {
+        lines.push(Line::from(Span::styled(
+            format!("  +{} more", open.len() - 6),
+            dim(),
+        )));
+    }
+    if !reply.is_empty() {
+        if !open.is_empty() {
+            lines.push(Line::raw(""));
+        }
+        lines.push(Line::from(Span::styled("Claude's last reply", dim())));
+        for l in reply {
+            lines.push(Line::from(Span::styled(
+                fit(&l, w.saturating_sub(2)),
+                Style::new().fg(th::fg()).add_modifier(Modifier::ITALIC),
+            )));
+        }
+    }
+}
+
 pub(super) fn session_card(f: &mut Frame, app: &App, area: Rect) {
     let Some(s) = app.selected() else { return };
     let me = app.shown[app.list.selected().unwrap_or(0)];
@@ -326,6 +391,11 @@ pub(super) fn session_card(f: &mut Frame, app: &App, area: Rect) {
     ));
     let state = if s.missing {
         Span::styled(" · transcript deleted", Style::new().fg(th::red()))
+    } else if let Some(l) = &s.live {
+        Span::styled(
+            format!(" · open now ({}) — Enter switches to it", l.tty),
+            Style::new().fg(th::green()),
+        )
     } else if s.cloud_id.is_some() || s.entrypoint.as_deref() == Some("remote") {
         Span::styled(" · claude.ai session", dim())
     } else {
@@ -400,6 +470,17 @@ pub(super) fn session_card(f: &mut Frame, app: &App, area: Rect) {
         lines.push(facts(half, left, right));
     }
 
+    if !s.needs.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled("NEEDS YOU", HEAD.fg(th::red()))));
+        for n in &s.needs {
+            lines.push(Line::from(vec![
+                Span::styled("! ", Style::new().fg(th::red())),
+                txt(n.clone()),
+            ]));
+        }
+    }
+
     heading(&mut lines, "What happened");
     for l in s.description().lines() {
         lines.push(Line::from(txt(l.to_string())));
@@ -410,6 +491,7 @@ pub(super) fn session_card(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(n.clone(), Style::new().fg(th::amber())),
         ]));
     }
+    left_off(&mut lines, s, w);
     if let Some(pct) = s.context_pct().filter(|p| *p >= 80) {
         heading(&mut lines, "Next");
         lines.push(Line::from(txt(format!(
@@ -1116,6 +1198,11 @@ pub(super) fn help(f: &mut Frame, area: Rect) {
         k("@today  @3d", "@yesterday · @week · @month · @2w"),
         k("ctx:>80", "context fill"),
         k("has:pr has:note", "is:pinned · is:hidden"),
+        k("is:open is:needs", "open right now · its PR needs you"),
+        k(
+            "on:tuesday",
+            "active that day (on:yesterday, on:2026-11-17)",
+        ),
     ];
     popup(
         f,

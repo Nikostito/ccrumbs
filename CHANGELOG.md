@@ -10,6 +10,19 @@ First public release, as **ccrumbs**. It is a rewrite in Rust of an earlier
 Python tool called cctrail.
 
 ### Added
+- **Where you left off:** Claude's open to-dos (from TodoWrite or
+  TaskCreate/TaskUpdate) and the start of its last reply, in the card,
+  `ccrumbs show` and the MCP `get_session` tool.
+- **What needs you:** sessions whose open PR has failing CI, a merge conflict,
+  requested changes, new feedback since the session, or an approval. Shown at
+  the top of the picker (checked in the background via `gh`), with
+  `ccrumbs needs` and `is:needs`.
+- **Already-open sessions:** running `claude` processes are matched to their
+  sessions and shown as *Open now*. Enter / `^o` switches to their tmux pane,
+  iTerm2 or Terminal tab, kitty window or WezTerm pane instead of starting a
+  second copy; `resume` and `go` take `--again`.
+- **Work log:** `ccrumbs log` with `--on tuesday`, `--since 2w`, `--created`
+  and `--md`; the `on:<day>` search filter.
 - Picker TUI: sessions grouped by Pinned / Here / day, with a detail card
   (facts, what happened, next step, PRs and who did what, same task, files).
   It also has Tasks and PRs views and a `?` overlay.

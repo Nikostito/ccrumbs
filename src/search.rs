@@ -9,6 +9,8 @@
 //! - `task:N`: sessions of task N (what the Tasks tab uses)
 //! - `t:ABC-123` / a bare `ABC-123`: sessions linked to that ticket
 //! - `is:pinned`, `is:hidden` (hidden sessions are left out otherwise), `has:note`
+//! - `is:open`: open right now in a running `claude`; `is:needs`: its PR needs you
+//! - `on:tuesday`, `on:yesterday`, `on:2026-11-17`: active that day
 
 use crate::context::Context;
 use crate::model::SessionRow;
@@ -35,6 +37,10 @@ pub struct Query {
     pub pinned: bool,
     pub hidden: bool,
     pub has_note: bool,
+    pub live: bool,
+    pub needs: bool,
+    /// `on:tuesday`: active on that local day.
+    pub on: Option<chrono::NaiveDate>,
 }
 
 fn start_of_day(days_ago: i64) -> DateTime<Utc> {
@@ -112,6 +118,14 @@ pub fn parse(q: &str) -> Query {
             out.hidden = true;
         } else if lw == "has:note" {
             out.has_note = true;
+        } else if lw == "is:open" || lw == "is:live" {
+            out.live = true;
+        } else if lw == "is:needs" || lw == "is:needs-you" {
+            out.needs = true;
+        } else if let Some(d) =
+            val(&["on:"]).and_then(|v| crate::worklog::parse_day(&v, Local::now().date_naive()))
+        {
+            out.on = Some(d);
         } else if crate::tickets::from_text(w).first().is_some_and(|k| k == w) {
             // An exact `ABC-123` typed on its own.
             out.tickets.push(w.to_string());
@@ -170,10 +184,11 @@ pub fn body(s: &SessionRow) -> String {
     .to_lowercase()
 }
 
-/// A one-off question: one prompt, nothing edited, no commits, no PR work.
+/// A one-off question: one prompt, nothing edited, no commits, no PR work, no to-dos.
 pub fn is_quick(s: &SessionRow) -> bool {
     s.user_prompts <= 1
         && s.files_edited.is_empty()
+        && s.todos.is_empty()
         && s.commits == 0
         && !s.prs.iter().any(|l| l.role.is_significant())
 }
@@ -269,6 +284,14 @@ pub fn passes(s: &SessionRow, task: Option<usize>, q: &Query) -> bool {
     if (q.pinned && !s.pinned) || (q.has_note && s.note.is_none()) {
         return false;
     }
+    if (q.live && s.live.is_none()) || (q.needs && s.needs.is_empty()) {
+        return false;
+    }
+    if let Some(d) = q.on
+        && !crate::worklog::active_days(s).contains(&d)
+    {
+        return false;
+    }
     if !q
         .tickets
         .iter()
@@ -327,9 +350,18 @@ impl Ranker {
                 continue;
             }
             let here = if o.here_first { c.tier[i] as u32 } else { 0 };
-            // Pinned sessions float to the top of the default view.
-            let pin = if s.pinned && q.text.is_empty() && q.prs.is_empty() {
-                1_000_000
+            // Pinned sessions float to the top of the default view, then ones whose
+            // PR needs you, then ones open right now.
+            let pin = if q.text.is_empty() && q.prs.is_empty() {
+                if s.pinned {
+                    4_000_000
+                } else if !s.needs.is_empty() {
+                    2_000_000
+                } else if s.live.is_some() {
+                    1_000_000
+                } else {
+                    0
+                }
             } else {
                 0
             };

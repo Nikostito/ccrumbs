@@ -95,6 +95,8 @@ enum Action {
     NewTab,
     CopyCmd,
     CopyId,
+    /// Enter (not in the menu).
+    Resume,
 }
 
 const MENU: &[(char, Action, &str)] = &[
@@ -274,6 +276,8 @@ use std::collections::HashMap;
 
 pub enum Outcome {
     Resume(Box<SessionRow>),
+    /// Switched to the terminal where the session is already open.
+    Switched(String),
     Quit,
 }
 
@@ -315,6 +319,11 @@ struct App {
     help: bool,
     /// Editor chooser: the editors found, and which one is highlighted.
     editor_pick: Option<(Vec<launch::Editor>, usize)>,
+    /// Session that's already open elsewhere, and the key that opens a second copy
+    /// when pressed again.
+    confirm_again: Option<(String, Action)>,
+    /// Background PR status refresh: (PRs updated, first error).
+    refresh: Option<std::sync::mpsc::Receiver<(usize, Option<String>)>>,
 }
 
 pub fn role_color(r: Role) -> Color {
@@ -370,6 +379,8 @@ impl App {
             offsets: [0; 3],
             help: false,
             editor_pick: None,
+            confirm_again: None,
+            refresh: None,
         };
         app.reload(db)?;
         Ok(app)
@@ -377,6 +388,7 @@ impl App {
 
     fn reload(&mut self, db: &Db) -> Result<()> {
         self.sessions = db.load_sessions()?;
+        crate::live::annotate(&mut self.sessions);
         self.prs = prview::build(&self.sessions, &db.load_prs()?);
         self.pr_by_key = self
             .prs
@@ -508,6 +520,9 @@ pub fn run(db: &mut Db, cfg: &Config, initial: &str) -> Result<Outcome> {
             cfg.projects_dir().display()
         );
     }
+    if cfg.refresh_prs && crate::github::available() {
+        start_refresh(&mut app, db);
+    }
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         term_leave();
@@ -519,9 +534,54 @@ pub fn run(db: &mut Db, cfg: &Config, initial: &str) -> Result<Outcome> {
     res
 }
 
+/// Check the status of your open PRs on GitHub in the background (at most every
+/// 10 minutes); the list updates when it's done.
+fn start_refresh(app: &mut App, db: &Db) {
+    let Ok(prs) = db.load_prs() else { return };
+    let stale = crate::needs::stale(&app.sessions, &prs, chrono::Duration::minutes(10));
+    if stale.is_empty() {
+        return;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let res = match Db::open() {
+            Ok(db) => crate::needs::refresh(&db, &stale),
+            Err(e) => (0, Some(format!("{e:#}"))),
+        };
+        let _ = tx.send(res);
+    });
+    app.refresh = Some(rx);
+}
+
+fn refresh_done(app: &mut App, db: &Db) {
+    let Some(rx) = &app.refresh else { return };
+    let Ok((n, err)) = rx.try_recv() else { return };
+    app.refresh = None;
+    if n > 0 {
+        let _ = app.reload_keep(db);
+        let needs = app.sessions.iter().filter(|s| !s.needs.is_empty()).count();
+        if needs > 0 && app.status.is_empty() {
+            app.status = format!(
+                "{needs} session{} need{} you: see the top of the list (is:needs)",
+                if needs == 1 { "" } else { "s" },
+                if needs == 1 { "s" } else { "" }
+            );
+        }
+    } else if let Some(e) = err
+        && app.status.is_empty()
+    {
+        app.status = format!("Couldn't check PR status: {}", truncate(&e, 80));
+    }
+}
+
 fn event_loop(term: &mut Term, app: &mut App, db: &mut Db, cfg: &Config) -> Result<Outcome> {
     loop {
+        refresh_done(app, db);
         term.draw(|f| draw(f, app))?;
+        // While the PR check runs, wake up now and then to show its result.
+        if app.refresh.is_some() && !event::poll(std::time::Duration::from_millis(300))? {
+            continue;
+        }
         let k = match event::read()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => k,
             Event::Paste(text) => {
@@ -530,8 +590,10 @@ fn event_loop(term: &mut Term, app: &mut App, db: &mut Db, cfg: &Config) -> Resu
             }
             _ => continue,
         };
+        // "Press again to open a second copy" lasts for one key press.
+        let confirm = app.confirm_again.take();
         // A failing action (export, note, editor, re-index…) is shown, not fatal.
-        let step = match on_key(app, k, db, cfg) {
+        let step = match on_key(app, k, db, cfg, confirm) {
             Ok(s) => s,
             Err(e) => {
                 app.status = format!("{e:#}");
@@ -646,6 +708,23 @@ fn open(app: &mut App, url: Option<String>, what: &str) {
     };
 }
 
+/// Run an action; a new tab for a session that's already open switches to it instead.
+fn act(
+    app: &mut App,
+    a: Action,
+    db: &mut Db,
+    cfg: &Config,
+    confirm: &Option<(String, Action)>,
+) -> Result<Step> {
+    if a == Action::NewTab
+        && let Some(s) = app.target().cloned()
+        && let Some(step) = already_open(app, &s, a, confirm)
+    {
+        return Ok(step);
+    }
+    do_action(app, a, db, cfg)
+}
+
 fn do_action(app: &mut App, a: Action, db: &mut Db, cfg: &Config) -> Result<Step> {
     match a {
         Action::OpenPr => {
@@ -755,6 +834,7 @@ fn do_action(app: &mut App, a: Action, db: &mut Db, cfg: &Config) -> Result<Step
                 app.status = format!("Copied: {cmd}");
             }
         }
+        Action::Resume => {}
         Action::CopyId => {
             if let Some(s) = app.target() {
                 launch::copy(&s.id);
@@ -957,7 +1037,46 @@ fn input_key(app: &mut App, k: KeyEvent, db: &mut Db) -> Result<Step> {
     Ok(Step::Stay)
 }
 
-fn on_key(app: &mut App, k: KeyEvent, db: &mut Db, cfg: &Config) -> Result<Step> {
+/// Before resuming (Enter) or opening a tab (^o): if the session is already open in a
+/// running claude, switch there instead. Returns the step to take, or None to go on.
+fn already_open(
+    app: &mut App,
+    s: &SessionRow,
+    action: Action,
+    confirm: &Option<(String, Action)>,
+) -> Option<Step> {
+    let live = s.live.as_ref()?;
+    if confirm
+        .as_ref()
+        .is_some_and(|(id, a)| *id == s.id && *a == action)
+    {
+        return None;
+    }
+    match crate::live::focus(live) {
+        Ok(m) => Some(Step::Exit(Outcome::Switched(format!(
+            "\"{}\" is already open: {m}",
+            truncate(&s.title(), 50)
+        )))),
+        Err(e) => {
+            let key = if action == Action::NewTab {
+                "^o"
+            } else {
+                "Enter"
+            };
+            app.status = format!("{e} — {key} again opens a second copy");
+            app.confirm_again = Some((s.id.clone(), action));
+            Some(Step::Stay)
+        }
+    }
+}
+
+fn on_key(
+    app: &mut App,
+    k: KeyEvent,
+    db: &mut Db,
+    cfg: &Config,
+    confirm: Option<(String, Action)>,
+) -> Result<Step> {
     // Alt+key works like Ctrl+key, for when tmux, zellij or an editor's terminal
     // takes the Ctrl shortcut (^b is tmux's prefix, for example).
     let ctrl = k
@@ -995,7 +1114,7 @@ fn on_key(app: &mut App, k: KeyEvent, db: &mut Db, cfg: &Config) -> Result<Step>
         if let KeyCode::Char(c) = k.code
             && let Some((_, a, _)) = MENU.iter().find(|(key, _, _)| *key == c)
         {
-            return do_action(app, *a, db, cfg);
+            return act(app, *a, db, cfg, &confirm);
         }
         return Ok(Step::Stay);
     }
@@ -1015,7 +1134,7 @@ fn on_key(app: &mut App, k: KeyEvent, db: &mut Db, cfg: &Config) -> Result<Step>
         _ => None,
     };
     if let Some(a) = action {
-        return do_action(app, a, db, cfg);
+        return act(app, a, db, cfg, &confirm);
     }
     match (k.code, ctrl) {
         (KeyCode::Char('c'), true) => return Ok(Step::Exit(Outcome::Quit)),
@@ -1028,11 +1147,13 @@ fn on_key(app: &mut App, k: KeyEvent, db: &mut Db, cfg: &Config) -> Result<Step>
         }
         (KeyCode::Enter, _) => match app.tab {
             Tab::Sessions => {
-                if let Some(s) = app.selected() {
+                if let Some(s) = app.selected().cloned() {
                     if s.missing {
                         app.status = "This transcript was deleted by Claude Code's retention; it can't be resumed.".into();
+                    } else if let Some(step) = already_open(app, &s, Action::Resume, &confirm) {
+                        return Ok(step);
                     } else {
-                        return Ok(Step::Exit(Outcome::Resume(Box::new(s.clone()))));
+                        return Ok(Step::Exit(Outcome::Resume(Box::new(s))));
                     }
                 }
             }

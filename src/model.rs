@@ -87,6 +87,20 @@ pub struct PrLink {
     pub evidence: String,
 }
 
+/// One item of Claude's to-do list (TodoWrite, or TaskCreate/TaskUpdate).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Todo {
+    pub text: String,
+    /// `pending`, `in_progress` or `completed`.
+    pub status: String,
+}
+
+impl Todo {
+    pub fn is_open(&self) -> bool {
+        self.status != "completed"
+    }
+}
+
 /// Everything extracted from one transcript file.
 #[derive(Debug, Clone, Default)]
 pub struct ParsedSession {
@@ -124,6 +138,10 @@ pub struct ParsedSession {
     /// `session_...` id of the claude.ai cloud session, if the transcript reveals one.
     pub cloud_id: Option<String>,
     pub last_reply: Option<String>,
+    /// Claude's to-do list as it stood at the end of the session.
+    pub todos: Vec<Todo>,
+    /// Local calendar days (`YYYY-MM-DD`) with activity, for the work log.
+    pub days: Vec<String>,
     pub fulltext: String,
     pub pr_links: Vec<PrLink>,
     /// Repo hints seen in tool output (e.g. `git push` lines), used to resolve bare `#N`.
@@ -170,6 +188,15 @@ pub struct SessionRow {
     pub prs: Vec<PrLink>,
     /// Transcript file no longer on disk (purged by Claude Code's retention).
     pub missing: bool,
+    /// Claude's last reply (capped).
+    pub last_reply: Option<String>,
+    pub todos: Vec<Todo>,
+    /// Local calendar days (`YYYY-MM-DD`) with activity.
+    pub days: Vec<String>,
+    /// Open right now in a running `claude` process (filled in at load time).
+    pub live: Option<crate::live::Live>,
+    /// Why this session needs you (its PR has failing CI, a conflict, new feedback…).
+    pub needs: Vec<String>,
 }
 
 impl SessionRow {
@@ -265,6 +292,30 @@ impl SessionRow {
         (self, c)
     }
 
+    /// The first `n` lines of Claude's last reply, without Markdown decoration.
+    pub fn reply_excerpt(&self, n: usize) -> Vec<String> {
+        self.last_reply
+            .as_deref()
+            .unwrap_or("")
+            .lines()
+            .map(|l| {
+                l.trim()
+                    .trim_start_matches(['#', '>', ' '])
+                    .replace("**", "")
+                    .replace('`', "")
+            })
+            .filter(|l| !l.is_empty() && !l.starts_with("```") && l != "---")
+            .take(n)
+            .collect()
+    }
+
+    /// To-dos not done yet, the one in progress first.
+    pub fn open_todos(&self) -> Vec<&Todo> {
+        let mut v: Vec<&Todo> = self.todos.iter().filter(|t| t.is_open()).collect();
+        v.sort_by_key(|t| t.status != "in_progress");
+        v
+    }
+
     pub fn short_id(&self) -> &str {
         &self.id[..self.id.len().min(8)]
     }
@@ -285,6 +336,23 @@ pub struct PrMeta {
     pub body_session: Option<String>,
     /// PR body carries the "Generated with Claude Code" footer.
     pub claude_footer: bool,
+    /// Live status, from `ccrumbs needs` / the picker's background refresh.
+    pub status: Option<PrStatus>,
+}
+
+/// What a PR is waiting on, as of `synced`.
+#[derive(Debug, Clone, Default)]
+pub struct PrStatus {
+    /// `APPROVED`, `CHANGES_REQUESTED`, `REVIEW_REQUIRED` or empty.
+    pub review_decision: String,
+    /// `pass`, `fail`, `pending`, or empty when there are no checks.
+    pub checks: String,
+    /// `MERGEABLE`, `CONFLICTING` or `UNKNOWN`.
+    pub mergeable: String,
+    /// Latest review or comment by someone other than the PR's author.
+    pub feedback_at: Option<String>,
+    pub feedback_by: Option<String>,
+    pub synced: String,
 }
 
 /// Context window of a model, in tokens. `context_windows` in the config overrides this
