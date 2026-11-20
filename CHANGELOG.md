@@ -4,7 +4,7 @@ All notable changes are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.0] - 2026-11-20
 
 ### Fixed
 - PRs view: the cursor jumped around when scrolling, because the list was
@@ -76,5 +76,6 @@ Python tool called cctrail.
 - `~/.cctrail` (index, pins, notes, settings) is copied to `~/.ccrumbs` on
   first run, and the `CCTRAIL_*` environment variables still work.
 
+[0.3.0]: https://github.com/nikostito/ccrumbs/releases/tag/v0.3.0
 [0.2.0]: https://github.com/nikostito/ccrumbs/releases/tag/v0.2.0
 [0.1.0]: https://github.com/nikostito/ccrumbs/releases/tag/v0.1.0
