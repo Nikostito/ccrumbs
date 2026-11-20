@@ -25,6 +25,9 @@ pub struct Config {
     /// Command that opens a project, e.g. "cursor", "open -a \"PyCharm\"", "nvim".
     /// Unset: ccrumbs asks the first time (Ctrl-E) and remembers.
     pub editor: Option<String>,
+    /// Check your open PRs' status (CI, reviews, conflicts) in the background when the
+    /// picker opens, at most every 10 minutes. Needs `gh`. Default: on.
+    pub refresh_prs: bool,
 }
 
 static TICKETS: std::sync::RwLock<std::collections::BTreeMap<String, String>> =
@@ -127,6 +130,7 @@ impl Default for Config {
             tickets: Default::default(),
             theme: "dark".into(),
             editor: None,
+            refresh_prs: true,
         }
     }
 }

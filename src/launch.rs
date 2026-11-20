@@ -25,6 +25,18 @@ fn shell_quote(s: &str) -> String {
 }
 
 /// Replace this process with `claude --resume <id>` inside the session's directory.
+/// When the session is open in a running `claude` already, switch to it: `Some(what
+/// happened)`. Errors when it can't be reached (pass `--again` to open a second copy).
+pub fn already_open(s: &SessionRow) -> Result<Option<String>> {
+    let Some(l) = &s.live else { return Ok(None) };
+    match crate::live::focus(l) {
+        Ok(m) => Ok(Some(format!("Already open: {m}"))),
+        Err(e) => bail!(
+            "{e}; resuming it twice makes both copies write to the same transcript (use --again to do it anyway)"
+        ),
+    }
+}
+
 pub fn resume_here(s: &SessionRow) -> Result<()> {
     let dir = s.resume_dir();
     if !Path::new(&dir).is_dir() {
@@ -66,7 +78,7 @@ fn find(bin: &str) -> Option<std::path::PathBuf> {
         .find(|p| p.is_file())
 }
 
-fn which(bin: &str) -> bool {
+pub fn which(bin: &str) -> bool {
     find(bin).is_some()
 }
 

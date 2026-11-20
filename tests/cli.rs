@@ -30,6 +30,8 @@ impl Env {
             .env("CLAUDE_CONFIG_DIR", self.root.join("claude"))
             .env("HOME", self.root.join("home"))
             .env("NO_COLOR", "1")
+            .env("TZ", "UTC")
+            .env("CCRUMBS_NO_LIVE", "1")
             .env_remove("CCTRAIL_HOME")
             .env_remove("TMUX")
             .current_dir(&self.root);
@@ -157,6 +159,10 @@ impl Env {
         // D continues WEB-142 from main: same task through the ticket.
         self.session("/work/web", "dddddddd-0000-4000-8000-000000000004", vec![
             user("/work/web", "main", ts(4, 9), "follow up on WEB-142: link contrast"),
+            tool(ts(4, 9), "td", "TodoWrite", json!({"todos": [
+                {"content": "Raise link contrast to 4.5:1", "status": "completed"},
+                {"content": "Check visited links", "status": "in_progress"},
+                {"content": "Screenshot both themes", "status": "pending"}]})),
             json!({"type":"assistant","timestamp":ts(4,9),"message":{"id":"m-d","content":[{"type":"text","text":"Fixed the contrast."}]}}),
         ]);
         // E: heredoc text that mentions gh commands must not count.
@@ -375,4 +381,50 @@ fn mcp_server() {
             .contains("Add per-key rate limiting")
     );
     assert_eq!(r[4]["error"]["code"], -32602);
+}
+
+#[test]
+fn where_you_left_off_and_work_log() {
+    let e = Env::new("log");
+    let show = e.ok(&["show", "dddd"]);
+    assert!(show.contains("2 of 3 to-dos open"), "{show}");
+    assert!(
+        show.contains("► Check visited links") && show.contains("○ Screenshot both themes"),
+        "{show}"
+    );
+    assert!(
+        !show.contains("Raise link contrast"),
+        "done items are left out: {show}"
+    );
+    assert!(show.contains("Fixed the contrast."), "{show}");
+
+    let day = e.ok(&["log", "--on", "2026-03-03"]);
+    assert!(day.starts_with("Tuesday 03 March"), "{day}");
+    assert!(
+        day.contains("Implement WEB-142 dark mode") && day.contains("created acme/web#7"),
+        "{day}"
+    );
+    assert!(!day.contains("rate limiting"), "{day}");
+    let md = e.ok(&["log", "--since", "2026-03-01", "--md"]);
+    assert!(md.contains("## Sunday 01 March"), "{md}");
+    assert!(
+        md.contains(
+            "- **Add per-key rate limiting to the public API** (api) — created acme/api#88"
+        ),
+        "{md}"
+    );
+    // Sessions with to-dos aren't one-off questions; the heredoc one (05 March) is.
+    assert!(md.contains("## Wednesday 04 March"), "{md}");
+    assert!(!md.contains("05 March"), "{md}");
+    let all = e.ok(&["log", "--since", "2026-03-01", "--md", "--all"]);
+    assert!(all.contains("## Thursday 05 March"), "{all}");
+    assert!(
+        e.ok(&["log", "--on", "2026-02-01"])
+            .contains("No sessions on")
+    );
+    assert!(!e.run(&["log", "--on", "someday"]).status.success());
+
+    let on = e.ok(&["list", "-s", "on:2026-03-02"]);
+    assert!(on.contains("bbbbbbbb") && !on.contains("aaaaaaaa"), "{on}");
+    assert!(e.ok(&["needs", "--offline"]).contains("Nothing needs you"));
 }
