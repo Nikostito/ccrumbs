@@ -795,26 +795,12 @@ pub(super) fn pr_list(f: &mut Frame, app: &mut App, area: Rect) {
         );
         return;
     }
-    let group = |p: &PrEntry| -> &'static str {
-        match p.state() {
-            Some("open") => "Open",
-            Some("merged") => "Merged",
-            Some("closed") => "Closed",
-            _ => "Not synced",
-        }
-    };
-    let mut order: Vec<usize> = (0..app.pr_shown.len()).collect();
-    let rank = |g: &str| {
-        ["Open", "Merged", "Closed", "Not synced"]
-            .iter()
-            .position(|x| *x == g)
-            .unwrap_or(9)
-    };
-    order.sort_by_key(|&k| rank(group(&app.prs[app.pr_shown[k]])));
+    // `pr_shown` is already in group order (see `App::refilter`), so rows are drawn
+    // in the same order the cursor moves through them.
     let mut rows = Vec::new();
     let mut cur = "";
-    for &k in &order {
-        let g = group(&app.prs[app.pr_shown[k]]);
+    for k in 0..app.pr_shown.len() {
+        let g = pr_group(&app.prs[app.pr_shown[k]]);
         if g != cur {
             if !rows.is_empty() {
                 rows.push(Row::Gap);

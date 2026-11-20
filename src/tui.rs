@@ -326,6 +326,23 @@ struct App {
     refresh: Option<std::sync::mpsc::Receiver<(usize, Option<String>)>>,
 }
 
+/// Heading a PR is listed under in the PRs view.
+fn pr_group(p: &PrEntry) -> &'static str {
+    match p.state() {
+        Some("open") => "Open",
+        Some("merged") => "Merged",
+        Some("closed") => "Closed",
+        _ => "Not synced",
+    }
+}
+
+fn pr_group_rank(p: &PrEntry) -> usize {
+    ["Open", "Merged", "Closed", "Not synced"]
+        .iter()
+        .position(|g| *g == pr_group(p))
+        .unwrap_or(9)
+}
+
 pub fn role_color(r: Role) -> Color {
     match r {
         Role::Created => th::green(),
@@ -453,6 +470,8 @@ impl App {
                 text.split_whitespace().all(|w| hay.contains(w))
             })
             .collect();
+        // Grouped by state for display; the sort is stable, so recency holds within a group.
+        self.pr_shown.sort_by_key(|&i| pr_group_rank(&self.prs[i]));
         self.list
             .select(if self.shown.is_empty() { None } else { Some(0) });
         self.task_list.select(if self.task_shown.is_empty() {
