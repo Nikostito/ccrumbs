@@ -228,9 +228,11 @@ right away and lists them; `is:needs` filters to them.
 
 Resuming a session that's still running in another terminal starts a second
 copy writing to the same transcript. ccrumbs finds running `claude`
-processes (a `--resume <id>` names the session; otherwise it's the session in
-that process's directory that it has been writing to) and marks them
-**Open now**. **Enter** or `^o` on one switches to where it runs:
+processes, works out which session each one is writing to (the newest one in
+its directory since it started; a `--resume <id>` only counts while that
+session is still the one being written), and marks them **Open now**. The
+picker re-checks every few seconds and again before switching. **Enter** or
+`^o` on one switches to where it runs:
 
 - a **tmux** pane (also across tmux sessions);
 - an **iTerm2** or **Terminal.app** tab (macOS);
@@ -456,9 +458,10 @@ cores with a warm disk cache:
   by reading the diff in chat counts as *reviewed* if you asked for a review.
 - **claude.ai web sessions can't be resumed locally.** `ccrumbs open <id>
   --cloud` opens them in the browser.
-- **Spotting open sessions works on macOS and Linux**, not Windows. A
-  session started without `--resume` is matched by its directory, after its
-  first message.
+- **Spotting open sessions works on macOS and Linux**, not Windows. It goes by
+  which transcript a `claude` process writes to, so a new session shows up
+  after its first message, and right after `/clear` the previous session still
+  shows as open until you type.
 - **Sessions deleted by Claude Code's cleanup** stay searchable (marked
   *transcript deleted*), but can't be resumed or read in full.
 
