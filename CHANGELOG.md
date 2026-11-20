@@ -4,10 +4,7 @@ All notable changes are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
-## [0.1.0] - unreleased
-
-First public release, as **ccrumbs**. It is a rewrite in Rust of an earlier
-Python tool called cctrail.
+## [0.2.0] - 2026-11-20
 
 ### Added
 - **Where you left off:** Claude's open to-dos (from TodoWrite or
@@ -23,6 +20,23 @@ Python tool called cctrail.
   second copy; `resume` and `go` take `--again`.
 - **Work log:** `ccrumbs log` with `--on tuesday`, `--since 2w`, `--created`
   and `--md`; the `on:<day>` search filter.
+
+### Changed
+- A session with to-dos no longer counts as a quick one-off.
+- `ccrumbs sync` updates PR rows in place instead of replacing them.
+- The index is upgraded to schema 7: transcripts are read once more to pick
+  up to-dos and active days.
+
+### Fixed
+- Release builds for macOS run on `macos-latest`, so tagged releases get
+  published again.
+
+## [0.1.0] - 2026-11-19
+
+First public release, as **ccrumbs**. It is a rewrite in Rust of an earlier
+Python tool called cctrail.
+
+### Added
 - Picker TUI: sessions grouped by Pinned / Here / day, with a detail card
   (facts, what happened, next step, PRs and who did what, same task, files).
   It also has Tasks and PRs views and a `?` overlay.
@@ -55,4 +69,5 @@ Python tool called cctrail.
 - `~/.cctrail` (index, pins, notes, settings) is copied to `~/.ccrumbs` on
   first run, and the `CCTRAIL_*` environment variables still work.
 
+[0.2.0]: https://github.com/nikostito/ccrumbs/releases/tag/v0.2.0
 [0.1.0]: https://github.com/nikostito/ccrumbs/releases/tag/v0.1.0
